@@ -102,8 +102,17 @@ User-confirmed v2 design for large conversations: bound every summarization call
 - [x] README: chunking behavior, Model Experience, Known Limitations
 - [x] Typecheck + build green
 
-## P9 — Deferred / optional
+## P9 — Per-chunk retry for `/trim-directive` parallel chunks
+
+Motivation (user-verified on "插件并发测试1"): the first parallel trim failed with `produced no text summary content` during a network/proxy switch — a single flaky chunk call sank the whole trim. The data layer's failure atomicity was correct (lifecycle closed, surface unchanged), but a transient hiccup should not require a full re-run of a multi-minute operation.
+
+- [x] `summarizeChunkWithRetry` — each chunk gets up to 3 attempts (1 initial + 2 retries) for transient failures (network hiccup, proxy switch, adapter 5xx); cancellation/abort and `DirectiveCompactionError` (expected failures) are never retried
+- [x] Unit tests (+2): transient failure retries and succeeds (2 stream calls, lifecycle complete); persistent failure gives up after 3 attempts with the lifecycle closed and surface unchanged
+- [x] README: parallel-trim retry behavior + real 403K/3-chunk verification data; DONE records the "插件并发测试1" case (1,055 nodes / 402,837 tokens → 3 chunks, output 23K with 73% reasoning, shrink passed)
+- [x] Typecheck + build green (71 unit tests: plan 16 + summarizer 13 + command 12 + trim 26 + loader-composition 3; + 3 e2e)
+
+## P10 — Deferred / optional
 
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek
-- [ ] BUG (user-verified, GUI): during `/trim-directive` "executing…", the dialogue stays visible with no progress feedback. The replacement DOES land when the trim finishes (verified) — the issue is UX only: the async LLM window (potentially many seconds, more with chunking) shows nothing changing. Options: a progress indicator (e.g. "compressing chunk 2/5…"), or a status line in the command result. Requires an upstream UI hook; the plugin can already surface progress via the command result text.
+- [ ] BUG (user-verified, GUI): the trimmed/compacted conversation never disappears from the UI dialogue — both during "executing…" and AFTER the command completes. Root cause (source-verified): this is dsh's deliberate transcript design, NOT a plugin bug. The UI conversation flow renders only append-origin events (`surfaceOp === 'append'`; `isAppendSurfaceEvent`), while a trim/compaction lands a `surfaceOp: { op: 'replace' }` checkpoint — "replacement copies stay model-only" (dsh `surface.ts`). So the model sees the checkpoint but the user keeps seeing the original dialogue; upstream `/compact` behaves identically (it shows a `manual-compaction` card only for the exact command name `compact`, which our commands do not match). The data layer is correct (checkpoint lands on the surface; verified on real sessions). Fixing the UI requires an upstream `ui-conversation` change to render a replacement/compaction card for non-`compact` command names — outside this plugin; the plugin-side fallback is documentation. Options: (a) upstream UI change (high effort, harness PR + Agent Note); (b) document that the original dialogue stays visible by design and the effect is visible in the session trace (current recommendation); (c) have the plugin name its command to trigger the existing `manual-compaction` card (pollutes upstream semantics, violates pure-increment).
