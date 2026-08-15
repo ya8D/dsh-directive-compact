@@ -1,0 +1,8 @@
+# The dsh-directive-compact bundle patch: insert the directive compaction
+# command plugin. Pure increment — nothing from the upstream composition is
+# disabled, no `ctx.compaction` slot is taken, and no automatic-compaction
+# listener is registered, so the official backend and `/compact` stay exactly
+# as they are.
+- insert:
+    - id: directive-compact
+      name: '@ya8d/dsh-directive-compact'

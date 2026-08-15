@@ -39,13 +39,12 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 
 ## P4 — Regression / polish
 
-- [ ] Regression test: a cancelled/failed directive compaction leaves the surface intact (lifecycle closed, no partial replace)
-- [ ] `cordis.patch.yml` — insert-only bundle row (currently declared in package.json; verify `--dump-config`)
+- [x] Regression test: a cancelled/failed directive compaction leaves the surface intact (lifecycle closed, no partial replace)
+- [x] `cordis.patch.yml` — insert-only bundle row (pure increment; `--dump-config` verification lands in P5)
 
 ## P5 — Bundle + verification
 
-- [ ] `cordis.patch.yml` — insert-only (disables nothing), pure increment
-- [ ] `--dump-config` verification
+- [ ] `--dump-config` verification of the inserted bundle row
 - [ ] With-key e2e: real DeepSeek model, self-skips without a key
 
 ## P6 — Documentation
