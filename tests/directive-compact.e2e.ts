@@ -13,6 +13,7 @@ import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { DirectiveCompactionError, executeDirectiveCompact } from '../src/command.js'
 import type { CommandConfig } from '../src/command.js'
+import { executeTrim } from '../src/command-trim.js'
 
 /**
  * With-key e2e: one real directive-driven compaction against the DeepSeek
@@ -121,6 +122,15 @@ function invocationFor(agent: Agent, rawInput: string): CommandInvocation {
   }
 }
 
+/** Rendered text of the live surface (model-visible view, not the log). */
+function surfaceText(session: Session): string {
+  return session.surface.nodes.map(seq => {
+    const message = session.deriveEventMessage(session.events[seq]!)
+    if (message === null) return ''
+    return message.content.map(block => block.type === 'text' ? block.text : '').join('')
+  }).join('\n')
+}
+
 describe.skipIf(key === undefined)('directive compaction with a real DeepSeek model', () => {
   it('summarizes the middle with the directive and replaces it', async () => {
     // describe.skipIf above guarantees the key; TS cannot narrow the module const.
@@ -218,4 +228,42 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
     // No lifecycle opened, no model call, no surface change.
     expect(s.events.length).toBe(before)
   }, 30_000)
+
+  it('trims the conversation with a real DeepSeek model (P8)', async () => {
+    const apiKeyValue = key as string
+    vi.stubEnv('DEEPSEEK_API_KEY', apiKeyValue)
+    const ctx = new Context()
+    contexts.push(ctx)
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(TokenMeter)
+    await ctx.plugin(LlmDeepSeek, {})
+
+    const s = sessionWithTurns(8)
+    const surfaceBefore = s.surface.nodes.length
+    // Real-model behavior is not fully deterministic, but a trim either
+    // succeeds (lifecycle + checkpoint replacing the dialogue) or the model's
+    // output fails the shrink check (summary error + lifecycle closed). The
+    // injected skeleton must survive either way.
+    try {
+      const result = await executeTrim(
+        ctx,
+        invocationFor(agentFor(s), 'drop all dialogue, keep nothing'),
+      )
+      expect(result.kind).toBe('success')
+      if (result.kind !== 'success') return
+      expect(result.text).toContain('per the requirement')
+      const types = s.events.slice(-4).map(e => e.type)
+      expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
+      // The dialogue is gone; the injected skeleton survives.
+      expect(s.surface.nodes.length).toBeLessThan(surfaceBefore)
+      expect(surfaceText(s)).toContain('rules')
+      expect(surfaceText(s)).toContain('skills')
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(DirectiveCompactionError)
+      const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
+      const after = s.events.slice(startIdx)
+      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
+      expect(s.surface.nodes.length).toBe(surfaceBefore)
+    }
+  }, 120_000)
 })
