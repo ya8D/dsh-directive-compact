@@ -1,7 +1,7 @@
 {
   "name": "@ya8d/dsh-directive-compact",
-  "description": "Pure-incremental directive-driven compaction for DeepSeek Harness: /compact-directive <requirement> summarizes the session middle per your requirement, /trim-directive <pattern> deletes matching surface content with zero protection",
-  "version": "0.1.0",
+  "description": "Pure-incremental directive-driven compaction for DeepSeek Harness: /compact-directive <requirement> summarizes the session middle per your requirement, /trim-directive <requirement> trims the whole conversation per your requirement",
+  "version": "0.1.0-rc.0",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -11,13 +11,20 @@
     "type": "git",
     "url": "git+https://github.com/ya8D/dsh-directive-compact.git"
   },
+  "bugs": {
+    "url": "https://github.com/ya8D/dsh-directive-compact/issues"
+  },
+  "homepage": "https://github.com/ya8D/dsh-directive-compact",
   "keywords": [
     "deepseek-harness",
+    "deepseek-ai",
     "dsh-plugin",
+    "plugin",
     "compaction",
     "directive",
     "context-compression"
   ],
+  "sideEffects": false,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -62,31 +69,32 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-commands": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-compaction": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-session": "^0.1.0-rc.5"
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-compaction": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/cordis-plugin-include": "^1.0.6",
     "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
-    "@deepseek-ai/dsh-agent": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-agent-loop": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-agent-loop-testkit": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-commands": "^0.1.0-rc.5",
-    "@deepseek-ai/dsh-compaction": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-commands": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-compaction": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-invariants": "0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-llm-deepseek": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-session": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-token-meter": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-token-meter": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0",
