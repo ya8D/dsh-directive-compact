@@ -24,6 +24,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { planCompaction, type SurfaceNodeInfo } from './plan.js'
 import { summarizeWithDirective, type DirectiveTarget } from './summarizer.js'
+import { shortDirective } from './log.js'
 
 /** Resolved plugin configuration, subset the command layer needs. */
 export interface CommandConfig {
@@ -142,11 +143,14 @@ export async function executeDirectiveCompact(
   invocation: CommandInvocation,
   config: CommandConfig,
 ): Promise<CommandResult> {
+  const logger = ctx.logger('dsh-directive-compact')
+  const startedAt = Date.now()
   const session = invocation.agent.session
   // Standalone compaction is only legal between turns; refuse while a turn is
   // open so the session invariant (`turn: null` inside an open turn) cannot trip.
   const openTurn = openTurnNumber(session)
   if (openTurn !== null) {
+    logger.debug('compact-directive: refused — an open turn (%d) is still in progress', openTurn)
     throw new DirectiveCompactionError(
       'busy',
       'directive compaction requires an idle session; a turn is still in progress',
@@ -159,6 +163,7 @@ export async function executeDirectiveCompact(
     keepTailUsers: config.keepTailUsers,
   })
   if (plan.kind === 'none') {
+    logger.debug('compact-directive: refused — no compactable middle span yet')
     return { kind: 'success', text: 'No compactable middle span yet.' }
   }
 
@@ -175,18 +180,25 @@ export async function executeDirectiveCompact(
     // hint. Failures DURING the lifecycle (shrink rejection, summarization)
     // must throw so the catch block closes the opened lifecycle; the two
     // failure styles are distinct on purpose.
+    logger.debug('compact-directive: refused — empty directive')
     return {
       kind: 'error',
       text: 'Usage: /compact-directive <requirement> — a natural-language description of what to keep and what to drop. For a plain summary with no requirement, use /compact.',
     }
   }
   const target = resolveDirectiveTarget(invocation.agent, config)
+  logger.info(
+    'compact-directive: begin — directive "%s", surface %d nodes, middle %d nodes to summarize, keep head %d / tail %d',
+    shortDirective(directive), nodes.length, plan.middleSeqs.length,
+    config.keepHeadUsers, config.keepTailUsers,
+  )
 
   // Middle span messages, in surface order, projected to the summarizer.
   const middleMessages = plan.middleSeqs
     .map(seq => messageFor(session, seq))
     .filter((message): message is Message => message !== null)
   if (middleMessages.length === 0) {
+    logger.debug('compact-directive: refused — the middle span produced no messages')
     return { kind: 'error', text: 'The middle span produced no messages to summarize.' }
   }
 
@@ -212,6 +224,7 @@ export async function executeDirectiveCompact(
       session.id,
       invocation.signal,
     )
+    logger.info('compact-directive: summarization done in %dms', Date.now() - startedAt)
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive compaction was cancelled')
     }
@@ -219,20 +232,11 @@ export async function executeDirectiveCompact(
       const message = messageFor(session, seq)
       return total + (message === null ? 0 : ctx.tokenMeter.estimateMessage(message))
     }, 0)
-    // Shrink validation (mirror of the upstream convergence check): the framed
-    // checkpoint must be smaller than the shadowed span, or the compaction
-    // would grow the context instead of shrinking it.
     const checkpointMessage = createUserMessage({
       content: summary.summary,
       source: compactCheckpointSource(compactionId, invocation.commandId),
     })
     const framedTokenCount = ctx.tokenMeter.estimateMessage(checkpointMessage)
-    if (framedTokenCount >= shadowedTokenCount) {
-      throw new DirectiveCompactionError(
-        'summary',
-        `directive compaction did not shrink the context (checkpoint ${framedTokenCount} tokens >= shadowed ${shadowedTokenCount})`,
-      )
-    }
     const shadowedRange = {
       start: plan.middleSeqs[0]!,
       end: plan.middleSeqs[plan.middleSeqs.length - 1]!,
@@ -252,12 +256,33 @@ export async function executeDirectiveCompact(
       rawOutput: summary.rawOutput as ContentBlock[],
       llmStreamCall: true,
     })
+    if (framedTokenCount >= shadowedTokenCount) {
+      // No change: the model's output is not smaller than the shadowed span
+      // (typically it found nothing worth dropping and returned the span
+      // essentially verbatim). That is a normal outcome, not a failure: record
+      // the output in the lifecycle, leave the surface untouched, and tell the
+      // user — never throw into a retry/hang on a rewrite that cannot shrink.
+      session.append('compaction/end', lifecycle)
+      logger.info(
+        'compact-directive: no change — checkpoint %d tokens >= shadowed %d tokens; surface untouched',
+        framedTokenCount, shadowedTokenCount,
+      )
+      return {
+        kind: 'success',
+        text: `Nothing to compact: the middle span could not be reduced (~${shadowedTokenCount} tokens unchanged).`,
+        sourceEventSeq: summaryEvent.seq,
+      }
+    }
     committing = true
     session.append('user/message', checkpointMessage, {
       surfaceOp: { op: 'replace', start: shadowedRange.start, end: shadowedRange.end },
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...plan.middleSeqs],
     })
     session.append('compaction/end', lifecycle)
+    logger.info(
+      'compact-directive: committed — compacted %d middle nodes (~%d tokens) → checkpoint %d tokens, %dms total',
+      plan.middleSeqs.length, shadowedTokenCount, framedTokenCount, Date.now() - startedAt,
+    )
     return {
       kind: 'success',
       text: `Compacted ${plan.middleSeqs.length} history items (~${shadowedTokenCount} tokens) per the directive.`,
@@ -266,6 +291,10 @@ export async function executeDirectiveCompact(
   } catch (error: unknown) {
     // A failed attempt still closes the lifecycle with the error.
     session.append('compaction/end', { ...lifecycle, error: String(error) })
+    logger.warn(
+      'compact-directive: failed — %s (%dms)',
+      error instanceof Error ? error.message : String(error), Date.now() - startedAt,
+    )
     if (error instanceof DirectiveCompactionError) throw error
     if (committing) {
       throw new DirectiveCompactionError('commit', String(error))

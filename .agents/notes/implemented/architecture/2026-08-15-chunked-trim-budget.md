@@ -2,6 +2,15 @@
 
 Status: implemented
 
+## Revision (2026-08-16): fixed 50K chunk budget
+
+The window-derived chunk numbers below (`per-chunk input = floor(W/5) = 200K`, `max chunks = 10`) are **superseded**: the plugin targets the 1M-window DeepSeek models, so the chunk size is now fixed rather than derived.
+
+- **Per-chunk input = 50K heuristic tokens** (~200K rendered chars at the meter's 4 chars/token). Motivation (user-verified on "复杂对话 (1)", `session-43a12820`): `/trim-directive 删除telemetry相关的内容` on a 199-node / ~178K-token surface — a single call under the old 200K budget — opened `compaction/start` and produced no summary/end for 10+ minutes (hung on the one large call). 50K chunks split that session into 4 parallel calls, each ~4× smaller and independently retriable.
+- **Max chunks = 20** (20 × 50K = 1M = the full window). `chunkTrimNodes` fails loud beyond it ("compact the session first").
+- **Execution stays full-parallel** (no artificial concurrency cap; up to 20 `ctx.llm.stream()` calls). Re-verified against dsh source: no llm-layer concurrency limiter exists; HTTP 429 is handled by the adapter's retryPolicy plus the per-chunk 3-attempt retry. CJK safety: the meter prices 4 chars/token, which UNDERCOUNTS Chinese (real tokenizers are ~1-1.5 chars/token), so a 50K-heuristic chunk can be ~150K real input tokens; input + the 256K output cap stays ≤ the 1M window, and the ~200K rendered chars are far under the summarizer's 4M-char guard.
+- `resolveTrimBudget` returns `{ maxTokens: min(window/2, adapterMax), chunkInputBudget: 50_000, maxChunks: 20 }`. The chunking algorithm (`chunkTrimNodes`) is unchanged — first-fit accumulation to the budget with roll-back to the balanced boundary ("首次超过 50K 就分片" is that behavior with the new constant).
+
 ## Problem
 
 `/trim-directive` hands the whole trim-able dialogue to the model in one call. A real GUI run failed with `directive summarization truncated at the token cap`: the fixture surface rendered enough input that the model's reasoning ate the 8192-token output budget before the trimmed output finished. The one-shot design had no bound tying the summarization call to the routed model's actual context window — a large or pathological surface could overflow the request or truncate the response.

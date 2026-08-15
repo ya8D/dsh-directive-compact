@@ -4,9 +4,10 @@
  * Registers two global commands. `/compact-directive <requirement>` keeps the
  * session's fixed skeleton and the head/tail user turns, and summarizes the
  * middle span per the user's natural-language requirement. `/trim-directive
- * <pattern>` deletes every surface node whose rendered text matches the
- * pattern, with zero region protection, through the upstream model-free prune
- * protocol. Neither inherits `BasicCompactionEngine` nor registers
+ * <requirement>` hands the ENTIRE surface to the model with a directive-only
+ * prompt and replaces it with the model's output as one checkpoint — no head,
+ * no tail, no system-node protection (the injected skeleton regenerates per
+ * request). Neither inherits `BasicCompactionEngine` nor registers
  * `ctx.compaction`, so both coexist with the upstream backend unchanged.
  * @module @ya8d/dsh-directive-compact
  */

@@ -7,19 +7,19 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { buildTrimPrompt, TRIM_INSTRUCTION, trimMarker, chunkTrimNodes, resolveTrimBudget } from '../src/trim.js'
-import { executeTrim, isInjectedSystemNode } from '../src/command-trim.js'
+import { createLoggerStub } from './helpers.js'
+import { executeTrim } from '../src/command-trim.js'
 import { DirectiveCompactionError } from '../src/command.js'
 
 describe('resolveTrimBudget', () => {
-  it('caps output at min(window/2, adapter max) and chunks at window/5', () => {
+  it('caps output at the 256K adapter cap on the 1M target and chunks at a fixed 50K with 20 chunks', () => {
+    // Only the 1M-window / 256K-cap target is supported; the adapter is always
+    // the min (256K < 500K = window/2), so the window branch of the min is
+    // deliberately not exercised.
     const budget = resolveTrimBudget(1_000_000, 256_000)
-    expect(budget.maxTokens).toBe(256_000) // min(500K, 256K)
-    expect(budget.chunkInputBudget).toBe(200_000) // 1M/5
-    expect(budget.maxChunks).toBe(10)
-  })
-  it('uses window/2 when the adapter cap is larger', () => {
-    const budget = resolveTrimBudget(1_000_000, 600_000)
-    expect(budget.maxTokens).toBe(500_000) // min(500K, 600K)
+    expect(budget.maxTokens).toBe(256_000)
+    expect(budget.chunkInputBudget).toBe(50_000) // fixed; targets the 1M window
+    expect(budget.maxChunks).toBe(20) // 20 × 50K = 1M
   })
   it('rejects invalid window or adapter cap', () => {
     expect(() => resolveTrimBudget(0, 256_000)).toThrow(/invalid context window/)
@@ -38,28 +38,29 @@ describe('chunkTrimNodes', () => {
   })
 
   it('splits into multiple chunks when the total exceeds one chunk budget', () => {
-    // 6 nodes × 60K = 360K > 200K chunk budget → 2 chunks.
-    const nodes = Array.from({ length: 6 }, (_, i) => ({ seq: i, tokens: 60_000 }))
+    // 6 nodes × 15K = 90K > 50K chunk budget → 2 chunks of 45K.
+    const nodes = Array.from({ length: 6 }, (_, i) => ({ seq: i, tokens: 15_000 }))
     const chunks = chunkTrimNodes(nodes, budget, () => true)
     expect(chunks.length).toBe(2)
-    expect(chunks[0]!.seqs).toEqual([0, 1, 2]) // 180K
-    expect(chunks[1]!.seqs).toEqual([3, 4, 5]) // 180K
+    expect(chunks[0]!.seqs).toEqual([0, 1, 2]) // 45K
+    expect(chunks[1]!.seqs).toEqual([3, 4, 5]) // 45K
   })
 
   it('rolls a cut back to a balanced boundary', () => {
-    const nodes = Array.from({ length: 6 }, (_, i) => ({ seq: i, tokens: 60_000 }))
-    // Accumulation reaches the 200K budget at node 3 (180K→240K? no: 60K×3=180K
-    // < 200K, 60K×4=240K ≥ 200K at node 4). The cut BEFORE node 4 is
-    // "unbalanced" (a tool pair spans it), so it rolls back to node 3, whose
-    // leading cut is balanced — the chunk ends before node 3.
-    const chunks = chunkTrimNodes(nodes, budget, node => node.seq !== 4)
-    expect(chunks[0]!.seqs).toEqual([0, 1, 2])
-    expect(chunks[1]!.seqs).toEqual([3, 4, 5])
+    const nodes = Array.from({ length: 6 }, (_, i) => ({ seq: i, tokens: 15_000 }))
+    // Accumulation crosses the 50K budget at node 3 (15K×3=45K < 50K,
+    // 15K×4=60K ≥ 50K at node 3). The cut BEFORE node 3 is "unbalanced" (a
+    // tool pair spans it), so it rolls back to before node 2, whose cut is
+    // balanced — the chunk ends before node 2.
+    const chunks = chunkTrimNodes(nodes, budget, node => node.seq !== 3)
+    expect(chunks[0]!.seqs).toEqual([0, 1])
+    expect(chunks[1]!.seqs).toEqual([2, 3, 4])
+    expect(chunks[2]!.seqs).toEqual([5])
   })
 
   it('takes an oversized single node whole rather than looping forever', () => {
     const nodes = [
-      { seq: 0, tokens: 1_000_000 }, // alone exceeds every budget
+      { seq: 0, tokens: 60_000 }, // alone exceeds the 50K chunk budget
       { seq: 1, tokens: 100 },
     ]
     const chunks = chunkTrimNodes(nodes, budget, () => false)
@@ -68,7 +69,7 @@ describe('chunkTrimNodes', () => {
   })
 
   it('fails loud when total input exceeds the chunk-count bound', () => {
-    // 9 nodes × 300K = 2.7M > 10 × 200K = 2M.
+    // 9 nodes × 300K = 2.7M > 20 × 50K = 1M.
     const nodes = Array.from({ length: 9 }, (_, i) => ({ seq: i, tokens: 300_000 }))
     expect(() => chunkTrimNodes(nodes, budget, () => true)).toThrow(/compact the session first/)
   })
@@ -89,20 +90,6 @@ describe('buildTrimPrompt', () => {
   it('fails loud on an empty requirement', () => {
     expect(() => buildTrimPrompt('')).toThrow(/non-empty requirement/)
     expect(() => buildTrimPrompt(undefined)).toThrow(/non-empty requirement/)
-  })
-})
-
-describe('isInjectedSystemNode', () => {
-  it('classifies plugin-sourced user messages as injected system nodes', () => {
-    expect(isInjectedSystemNode('agent-instructions', 'user/message')).toBe(true)
-    expect(isInjectedSystemNode('@deepseek-ai/dsh-system-prompt', 'user/message')).toBe(true)
-    expect(isInjectedSystemNode('skill-catalog', 'user/message')).toBe(true)
-    expect(isInjectedSystemNode('compact', 'user/message')).toBe(true)
-  })
-  it('classifies genuine user utterances as trim-able dialogue', () => {
-    expect(isInjectedSystemNode('user', 'user/message')).toBe(false)
-    expect(isInjectedSystemNode('assistant/message', 'assistant/message')).toBe(false)
-    expect(isInjectedSystemNode('tool/result', 'tool/result')).toBe(false)
   })
 })
 
@@ -162,7 +149,7 @@ function invocationFor(agent: Agent, rawInput: string, signal: AbortSignal = new
 }
 
 /** A fake context whose `llm.stream` yields the given chunks. */
-function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm' | 'tokenMeter'> {
+function fakeCtx(chunks: readonly StreamChunk[], logger?: Context['logger']): Pick<Context, 'llm' | 'tokenMeter' | 'logger'> {
   return {
     llm: {
       async *stream(): AsyncIterable<StreamChunk> {
@@ -173,7 +160,8 @@ function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm' | 'tokenMe
       },
     } as unknown as Context['llm'],
     tokenMeter: meterWith(() => 10),
-  } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    logger: logger ?? createLoggerStub().logger,
+  } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
 }
 
 /** A token meter whose per-message estimate is `estimate`, with measure support. */
@@ -211,11 +199,8 @@ describe('executeTrim', () => {
     expect(result.kind).toBe('error')
   })
 
-  it('returns success with no changes when there is no conversational content', async () => {
+  it('returns success with no changes on a completely empty surface', async () => {
     const s = Session.create(SessionId('trim-empty'))
-    s.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'rules' }], source: { kind: 'plugin', plugin: 'agent-instructions' },
-    }), { surfaceOp: 'append' })
     const result = await executeTrim(fakeCtx(TRIM_CHUNKS) as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
@@ -241,16 +226,16 @@ describe('executeTrim', () => {
     expect(source.plugin).toBe('compact')
   })
 
-  it('preserves the injected system nodes outside the trim range', async () => {
+  it('P10 full-freedom: the whole surface is in the trim range, including the injected skeleton', async () => {
     const s = sessionWithTurns(5)
     const result = await executeTrim(fakeCtx(TRIM_CHUNKS) as never, invocationFor(agentFor(s), 'drop all dialogue'))
     expect(result.kind).toBe('success')
-    // The system injections survive verbatim.
+    // The injected skeleton is NOT preserved: the whole surface was shadowed
+    // and replaced by the checkpoint (system nodes regenerate per request).
     const text = surfaceText(s)
-    expect(text).toContain('rules')
-    expect(text).toContain('ctx')
-    expect(text).toContain('skills')
-    // The replaced checkpoint lands after them.
+    expect(text).not.toContain('rules')
+    expect(text).not.toContain('ctx')
+    expect(text).not.toContain('skills')
     expect(text).toContain(trimMarker('drop all dialogue'))
   })
 
@@ -272,12 +257,14 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await executeTrim(ctx as never, invocationFor(agentFor(s), '删除所有和 doc 相关的内容'))
     expect(seenPrompt).toContain('删除所有和 doc 相关的内容')
-    // The injected system nodes are NOT rendered into the prompt.
-    expect(seenPrompt).not.toContain('rules')
-    expect(seenPrompt).not.toContain('skills')
+    // P10 full-freedom: the injected skeleton IS rendered (whole surface goes
+    // to the model; the nodes regenerate per request anyway).
+    expect(seenPrompt).toContain('rules')
+    expect(seenPrompt).toContain('skills')
   })
 
   it('refuses standalone trim while a turn is open (busy)', async () => {
@@ -288,8 +275,9 @@ describe('executeTrim', () => {
     expect(s.events.some(e => e.type === 'compaction/start')).toBe(false)
   })
 
-  it('rejects a trim whose checkpoint is not smaller than the shadowed span (shrink)', async () => {
+  it('treats an unshrunk checkpoint as a no-change success (nothing to trim)', async () => {
     const s = sessionWithTurns(5)
+    const surfaceBefore = [...s.surface.nodes]
     const ctx = fakeCtx(TRIM_CHUNKS)
     // Distinguish the framed checkpoint from the shadowed nodes by content:
     // the checkpoint carries the trim marker + guard, the shadowed
@@ -301,11 +289,19 @@ describe('executeTrim', () => {
         const text = message.content.map(b => b.text).join('')
         return text.includes('[Directive trim, per requirement') ? 1000 : 10
       }),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
-    await expect(executeTrim(inflated as never, invocationFor(agentFor(s), 'drop all')))
-      .rejects.toThrow(DirectiveCompactionError)
-    // The lifecycle is still closed.
-    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
+      logger: ctx.logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(inflated as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(result.text).toContain('Nothing to trim')
+    // Lifecycle start → summary → end with NO user/message replace; the
+    // surface is untouched and the end is a success (no error).
+    const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
+    const after = s.events.slice(startIdx).map(e => e.type)
+    expect(after).toEqual(['compaction/start', 'compaction/summary', 'compaction/end'])
+    expect(s.surface.nodes).toEqual(surfaceBefore)
+    expect((s.events[s.events.length - 1]!.data as { error?: string }).error).toBeUndefined()
   })
 
   it('closes the lifecycle with an error on summarization failure', async () => {
@@ -330,7 +326,8 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all')))
       .rejects.toThrow(/no context window/)
     // The refusal happens before compaction/start opens.
@@ -350,7 +347,8 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all')))
       .rejects.toThrow()
     expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
@@ -377,7 +375,8 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
     expect(streamCalls).toBe(2) // 1 initial + 1 retry
@@ -399,7 +398,8 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all')))
       .rejects.toThrow(DirectiveCompactionError)
     expect(streamCalls).toBe(3) // 1 initial + 2 retries
@@ -424,7 +424,8 @@ describe('executeTrim', () => {
         },
       },
       tokenMeter: meterWith(() => 10),
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all', controller.signal)))
       .rejects.toThrow(DirectiveCompactionError)
     expect(streamCalls).toBe(1) // no retry after abort
@@ -435,7 +436,8 @@ describe('executeTrim', () => {
   it('P8: splits a large surface into parallel chunks and assembles [part N/M]', async () => {
     const s = sessionWithTurns(5)
     const before = s.events.length
-    // 9 shadowed nodes × 60K = 540K > 200K chunk budget → 3 chunks of 180K.
+    // Full-freedom range = all 13 surface nodes (5 turns + 3 injected
+    // skeleton) × 15K each; the per-chunk budget is 50K.
     let streamCalls = 0
     const ctx = {
       llm: {
@@ -454,31 +456,74 @@ describe('executeTrim', () => {
       tokenMeter: {
         estimateMessage: () => 10,
         measure: (sess: Session) => {
-          const nodes = sess.surface.nodes.map(seq => ({ seq, tokens: 60_000 }))
-          return { nodes, totalTokens: nodes.length * 60_000, surfaceTokens: nodes.length * 60_000 }
+          const nodes = sess.surface.nodes.map(seq => ({ seq, tokens: 15_000 }))
+          return { nodes, totalTokens: nodes.length * 15_000, surfaceTokens: nodes.length * 15_000 }
         },
       },
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
-    // 9 shadowed nodes × 60K = 540K > 200K chunk budget → 3 chunks of 180K
-    // (three parallel stream calls).
-    expect(streamCalls).toBe(3)
+    // 13 nodes × 15K = 195K > 50K chunk budget → chunks of 3 nodes (45K):
+    // 13 nodes = 4 full chunks + 1 remainder chunk = 5 parallel stream calls.
+    expect(streamCalls).toBe(5)
     // Lifecycle still start → summary → replace → end.
     const types = s.events.slice(before).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
-    // The checkpoint contains [part 1/3], [part 2/3], [part 3/3] markers.
+    // The checkpoint contains [part N/5] markers.
     const summaryEvent = s.events[before + 1]!
     const summaryBlocks = (summaryEvent.data as { summary: { type: string; text: string }[] }).summary
     const text = summaryBlocks.map(b => b.text).join('\n')
-    expect(text).toContain('[part 1/3]')
-    expect(text).toContain('[part 2/3]')
-    expect(text).toContain('[part 3/3]')
+    expect(text).toContain('[part 1/5]')
+    expect(text).toContain('[part 5/5]')
     // The single head marker appears once; part bodies are appended.
     expect(text.split('[Directive trim, per requirement: drop all]').length - 1).toBe(1)
     // Usage is merged across chunks.
     const usage = (summaryEvent.data as { usage?: { inputTokens: number } }).usage
-    expect(usage?.inputTokens).toBe(3)
+    expect(usage?.inputTokens).toBe(5)
+  })
+
+  it('logs phase milestones with timings for a multi-chunk trim', async () => {
+    const s = sessionWithTurns(5)
+    const stub = createLoggerStub()
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          for (const chunk of TRIM_CHUNKS) yield chunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: {
+        estimateMessage: () => 10,
+        measure: (sess: Session) => {
+          const nodes = sess.surface.nodes.map(seq => ({ seq, tokens: 15_000 }))
+          return { nodes, totalTokens: nodes.length * 15_000, surfaceTokens: nodes.length * 15_000 }
+        },
+      },
+      logger: stub.logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop telemetry'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    const info = stub.records.filter(r => r.level === 'info')
+    // Begin names the directive, the surface size, and the budget (the stub
+    // records raw printf args: format string first, then the values).
+    const begin = info.find(r => String(r.args[0]).includes('trim-directive: begin'))
+    expect(begin).toBeDefined()
+    expect(begin!.args[1]).toBe('drop telemetry')
+    expect(begin!.args[2]).toBe(13) // surface nodes
+    expect(begin!.args[5]).toBe(20) // max chunks
+    // Per-chunk completion reports a duration; the summary reports the totals.
+    expect(info.some(r => String(r.args[0]).includes('chunk %d/%d done in'))).toBe(true)
+    expect(info.some(r => String(r.args[0]).includes('all %d chunks done in'))).toBe(true)
+    const committed = info.find(r => String(r.args[0]).includes('trim-directive: committed'))
+    expect(committed).toBeDefined()
+    expect(committed!.args[0]).toContain('%dms total')
+    // Chunk geometry is debug-level (hidden at the default console threshold).
+    const debug = stub.records.filter(r => r.level === 'debug').map(r => r.args.join(' '))
+    expect(debug.some(m => m.includes('chunk %d/%d — seqs'))).toBe(true)
   })
 })

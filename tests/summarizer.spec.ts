@@ -10,16 +10,18 @@ import {
   summarizeWithDirective,
   type DirectiveTarget,
 } from '../src/summarizer.ts'
+import { createLoggerStub } from './helpers.js'
 
 /** A fake context whose `llm.stream` yields the given chunks. */
-function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm'> {
+function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm' | 'logger'> {
   return {
     llm: {
       async *stream(): AsyncIterable<StreamChunk> {
         for (const chunk of chunks) yield chunk
       },
     } as unknown as Context['llm'],
-  } as unknown as Pick<Context, 'llm'>
+    logger: createLoggerStub().logger,
+  } as unknown as Pick<Context, 'llm' | 'logger'>
 }
 
 function textChunk(index: number): StreamChunk {

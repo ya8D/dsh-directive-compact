@@ -1,14 +1,16 @@
 /**
  * The `/trim-directive <requirement>` command transaction.
  *
- * Hands the ENTIRE conversational surface (real user utterances, assistant
- * replies, tool results — but NOT the injected system nodes) to the model with
- * a directive-only prompt, and replaces the whole trim range with the model's
- * trimmed output as one checkpoint. Zero region protection: the user's
- * natural-language requirement decides what survives. System nodes
- * (`agent-instructions` / `system-prompt` / `skill-catalog`) are session
- * machinery, not dialogue — they are excluded from the render AND from the
- * replaced range, so the model keeps its environment after the trim.
+ * Hands the ENTIRE surface to the model with a directive-only prompt, and
+ * replaces it with the model's trimmed output as one checkpoint. Full freedom
+ * (P10): no head, no tail, no system-node protection — the injected skeleton
+ * (`agent-instructions` / `system-prompt` / `skill-catalog`) and any `compact`
+ * checkpoint are trim-able like any other node. That is safe because the agent
+ * loop re-injects the skeleton on every request (`systemPrompt.assemble()` in
+ * `preStep`, `agent-instructions` composing into `agent/pre-step` messages),
+ * so the model keeps its environment without manual re-injection. The only
+ * constraint kept is tool-pairing balance (a replace cannot split a
+ * tool-call/result pair).
  * @module @ya8d/dsh-directive-compact/command-trim
  */
 
@@ -28,51 +30,28 @@ import { summarizeWithDirective } from './summarizer.js'
 import type { DirectiveSummaryResult, DirectiveTarget } from './summarizer.js'
 import { CHECKPOINT_GUARD } from './summarizer.js'
 import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, type PricedTrimNode, type TrimBudget } from './trim.js'
-import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget, surfaceNodes } from './command.js'
+import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget } from './command.js'
+import { shortDirective } from './log.js'
 
 /**
- * Whether a surface node is injected system context rather than real dialogue.
- * System injections are `user/message` events whose source kind is a plugin
- * name (`agent-instructions`, `@deepseek-ai/dsh-system-prompt`,
- * `skill-catalog`, or a `compact` checkpoint). They are session machinery:
- * injected once at session start, never re-injected after a replacement, and
- * required for the model's environment — so they are never trim-able content.
+ * Select the trim range: the ENTIRE surface, with no system-node protection.
  *
- * The dual of `plan.ts`'s `isUserUtterance` (which tests the same
- * `user/message` source-kind distinction for the opposite answer); the two
- * take different inputs on purpose — this one raw `kind`/`type` for the
- * surface-node list, that one a `SurfaceNodeInfo` — so neither supersedes the
- * other, and this is the only `isInjectedSystemNode` in the package.
- * @param kind - the node's source kind (see {@link surfaceNodes}).
- * @param type - the node's surface event type.
- * @returns true when the node is injected system context.
- */
-export function isInjectedSystemNode(kind: string, type: string): boolean {
-  return type === 'user/message' && kind !== 'user'
-}
-
-/**
- * Select the trim range: from just after the LAST injected system node through
- * the surface tail. System nodes (`agent-instructions` / `system-prompt` /
- * `skill-catalog`) sit between the first user message and the rest of the
- * dialogue, and a surface `replace` shadows one contiguous range — so the only
- * range that keeps every injected node outside the replacement is the span
- * after the last one. The session's opening anchor (first user message) stays
- * outside too, as a structural consequence, not a protection policy.
+ * Full freedom (user-confirmed): a trim may reach every surface node,
+ * including the injected skeleton (`agent-instructions` / `system-prompt` /
+ * `skill-catalog`) and any `compact` checkpoint. This is safe because those
+ * injections are re-created on every request by the agent loop
+ * (`systemPrompt.assemble()` in `preStep`, `agent-instructions` composing into
+ * `agent/pre-step` messages) — deleting the surface copies does not remove the
+ * model's environment. A `compact` checkpoint's content lives in the
+ * append-only log, recoverable by tooling. The only constraint kept is
+ * tool-pairing balance (a replace cannot split a tool-call/result pair).
  * @param session - session whose surface is read.
- * @returns the inclusive span of trim-able nodes, or `null` when none exist.
+ * @returns the full inclusive span, or `null` when the surface is empty.
  */
 function selectTrimRange(session: Session): { start: number; end: number; shadowedSeqs: number[] } | null {
   const surface = session.surface.nodes
-  const nodes = surfaceNodes(session)
-  const lastInjected = nodes.findLastIndex(info => isInjectedSystemNode(info.kind, info.type))
-  const firstTrim = lastInjected + 1
-  const lastTrim = nodes.findLastIndex(info => !isInjectedSystemNode(info.kind, info.type))
-  if (firstTrim > lastTrim || lastTrim === -1) return null
-  const start = surface[firstTrim]!
-  const end = surface[lastTrim]!
-  const shadowedSeqs = surface.slice(firstTrim, lastTrim + 1)
-  return { start, end, shadowedSeqs }
+  if (surface.length === 0) return null
+  return { start: surface[0]!, end: surface[surface.length - 1]!, shadowedSeqs: [...surface] }
 }
 
 /**
@@ -85,6 +64,8 @@ export async function executeTrim(
   ctx: Context,
   invocation: CommandInvocation,
 ): Promise<CommandResult> {
+  const logger = ctx.logger('dsh-directive-compact')
+  const startedAt = Date.now()
   const session = invocation.agent.session
   const directive = invocation.rawInput.trim()
   if (directive.length === 0) {
@@ -94,6 +75,7 @@ export async function executeTrim(
     // layer renders it as a usage hint. Failures DURING the lifecycle (shrink
     // rejection, summarization) must throw so the catch block closes the
     // opened lifecycle; the two failure styles are distinct on purpose.
+    logger.debug('trim-directive: refused — empty directive')
     return {
       kind: 'error',
       text: 'Usage: /trim-directive <requirement> — a natural-language description of what to delete and what to keep',
@@ -102,6 +84,7 @@ export async function executeTrim(
   // The trim is a standalone summarization transaction between turns; refuse
   // while a turn is open so the rewrite cannot race an in-flight request.
   if (openTurnNumber(session) !== null) {
+    logger.debug('trim-directive: refused — an open turn is still in progress')
     throw new DirectiveCompactionError(
       'busy',
       'directive trim requires an idle session; a turn is still in progress',
@@ -110,6 +93,7 @@ export async function executeTrim(
 
   const range = selectTrimRange(session)
   if (range === null) {
+    logger.debug('trim-directive: refused — empty surface')
     return { kind: 'success', text: 'No conversational content to trim.' }
   }
 
@@ -145,7 +129,8 @@ export async function executeTrim(
   })
   // Budget the summarization against the routed model's real window so no
   // single call (and no chunk) can overflow the context: maxTokens =
-  // min(window/2, adapter max output), per-chunk input = window/5.
+  // min(window/2, adapter max output), per-chunk input = 50K heuristic tokens
+  // (fixed; targets the 1M-window DeepSeek models), max 20 chunks.
   const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, invocation.signal)
   if (modelInfo.context?.contextWindow === undefined) {
     // A silent 1M fallback would over-budget a smaller-window model (chunks
@@ -158,6 +143,11 @@ export async function executeTrim(
   const budget = resolveTrimBudget(
     modelInfo.context.contextWindow,
     256_000, // adapter hard per-response cap (llm-deepseek DEFAULT_MAX_TOKENS)
+  )
+  logger.info(
+    'trim-directive: begin — directive "%s", surface %d nodes, budget maxTokens %d / chunk input %d / max chunks %d',
+    shortDirective(directive), shadowedSeqs.length,
+    budget.maxTokens, budget.chunkInputBudget, budget.maxChunks,
   )
 
   const compactionId = CompactionId(crypto.randomUUID())
@@ -183,10 +173,23 @@ export async function executeTrim(
     if (chunks.length === 0) {
       return { kind: 'success', text: 'No conversational content to trim.' }
     }
+    const pricedTokens = priced.reduce((total, node) => total + node.tokens, 0)
+    logger.info(
+      'trim-directive: priced %d nodes (~%d tokens) → %d chunk(s)',
+      priced.length, pricedTokens, chunks.length,
+    )
+    for (const [index, chunk] of chunks.entries()) {
+      logger.debug(
+        'trim-directive: chunk %d/%d — seqs %d-%d, ~%d tokens',
+        index + 1, chunks.length, chunk.seqs[0], chunk.seqs[chunk.seqs.length - 1], chunk.tokens,
+      )
+    }
 
-    // Summarize every chunk in parallel. Each chunk is a full trim call over
-    // its own rendered span; HTTP 429 rate limits are retried by the adapter's
-    // retryPolicy. All chunks share the same directive and marker.
+    // Summarize every chunk in full parallel (up to 20 — no artificial
+    // concurrency cap). Each chunk is a full trim call over its own rendered
+    // span; HTTP 429 rate limits are retried by the adapter's retryPolicy and
+    // again by the per-chunk retry below. All chunks share the same directive
+    // and marker.
     //
     // Per-chunk retry: a transient failure on ONE chunk (network hiccup,
     // proxy switch, adapter 5xx) must not sink the whole trim. Each chunk gets
@@ -197,6 +200,7 @@ export async function executeTrim(
         const event = session.events[seq]
         return event === undefined ? [] : (session.deriveEventMessage(event) === null ? [] : [session.deriveEventMessage(event)!])
       })
+      const chunkStartedAt = Date.now()
       const result = await summarizeChunkWithRetry(
         ctx,
         target,
@@ -206,11 +210,16 @@ export async function executeTrim(
         session.id,
         invocation.signal,
       )
+      logger.info(
+        'trim-directive: chunk %d/%d done in %dms (%d output tokens)',
+        index + 1, chunks.length, Date.now() - chunkStartedAt, result.usage?.outputTokens ?? 0,
+      )
       return { result, index }
     }))
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
     }
+    logger.info('trim-directive: all %d chunks done in %dms', chunks.length, Date.now() - startedAt)
 
     // Assemble one checkpoint: marker + guard once, then each chunk's text
     // blocks under a [part N/M] divider.
@@ -236,19 +245,11 @@ export async function executeTrim(
     }
 
     const shadowedTokenCount = priced.reduce((total, node) => total + node.tokens, 0)
-    // Shrink validation: the framed checkpoint must be smaller than the
-    // shadowed span (mirror of the upstream convergence check).
     const checkpoint = createUserMessage({
       content: assembled,
       source: compactCheckpointSource(compactionId, invocation.commandId),
     })
     const framedTokenCount = ctx.tokenMeter.estimateMessage(checkpoint)
-    if (framedTokenCount >= shadowedTokenCount) {
-      throw new DirectiveCompactionError(
-        'summary',
-        `directive trim did not shrink the context (checkpoint ${framedTokenCount} tokens >= shadowed ${shadowedTokenCount})`,
-      )
-    }
     const summaryEvent = session.append('compaction/summary', {
       compactionId,
       sourceCommandId: invocation.commandId,
@@ -263,12 +264,34 @@ export async function executeTrim(
       rawOutput,
       llmStreamCall: true,
     })
+    if (framedTokenCount >= shadowedTokenCount) {
+      // No change: the model's output is not smaller than the shadowed span
+      // (typically it found nothing matching the requirement and returned the
+      // context essentially verbatim). That is a normal outcome, not a
+      // failure: record the output in the lifecycle, leave the surface
+      // untouched, and tell the user — never throw into a retry/hang on a
+      // rewrite that cannot shrink.
+      session.append('compaction/end', lifecycle)
+      logger.info(
+        'trim-directive: no change — checkpoint %d tokens >= shadowed %d tokens; surface untouched',
+        framedTokenCount, shadowedTokenCount,
+      )
+      return {
+        kind: 'success',
+        text: `Nothing to trim: the model found no content worth removing (~${shadowedTokenCount} tokens unchanged).`,
+        sourceEventSeq: summaryEvent.seq,
+      }
+    }
     committing = true
     session.append('user/message', checkpoint, {
       surfaceOp: { op: 'replace', start, end },
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
     })
     session.append('compaction/end', lifecycle)
+    logger.info(
+      'trim-directive: committed — trimmed %d nodes (~%d tokens) → checkpoint %d tokens, %dms total',
+      shadowedSeqs.length, shadowedTokenCount, framedTokenCount, Date.now() - startedAt,
+    )
     return {
       kind: 'success',
       text: `Trimmed ${shadowedSeqs.length} history items (~${shadowedTokenCount} tokens, ${partCount} chunk${partCount === 1 ? '' : 's'}) per the requirement.`,
@@ -277,6 +300,10 @@ export async function executeTrim(
   } catch (error: unknown) {
     // A failed attempt still closes the lifecycle with the error.
     session.append('compaction/end', { ...lifecycle, error: String(error) })
+    logger.warn(
+      'trim-directive: failed — %s (%dms)',
+      error instanceof Error ? error.message : String(error), Date.now() - startedAt,
+    )
     if (error instanceof DirectiveCompactionError) throw error
     if (committing) {
       throw new DirectiveCompactionError('commit', String(error))
@@ -318,6 +345,7 @@ async function summarizeChunkWithRetry(
   sessionId: SessionId,
   signal: AbortSignal,
 ): Promise<DirectiveSummaryResult> {
+  const logger = ctx.logger('dsh-directive-compact')
   const attempts = 3 // 1 initial + 2 retries
   let lastError: unknown
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -339,6 +367,13 @@ async function summarizeChunkWithRetry(
       // Non-retryable: expected directive-compaction failures (shrink etc.)
       // are not transient network issues.
       if (error instanceof DirectiveCompactionError) throw error
+      if (attempt < attempts - 1) {
+        logger.warn(
+          'trim-directive: chunk call failed, retrying (%d/%d): %s',
+          attempt + 2, attempts,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
     }
   }
   throw lastError

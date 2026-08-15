@@ -11,9 +11,10 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { DirectiveCompactionError, executeDirectiveCompact } from '../src/command.js'
+import { executeDirectiveCompact } from '../src/command.js'
 import type { CommandConfig } from '../src/command.js'
 import { executeTrim } from '../src/command-trim.js'
+import { trimMarker } from '../src/trim.js'
 
 /**
  * With-key e2e: one real directive-driven compaction against the DeepSeek
@@ -62,6 +63,9 @@ function appendTurn(session: Session, turn: number, userText: string, assistantT
   session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: userText }], source: { kind: 'user' },
   }), { surfaceOp: 'append' })
+  // A real assistant reply sits inside a step; the token meter requires the
+  // step/start so `measure()` can price the surface.
+  session.append('step/start', { turn, step: 1 })
   session.append('assistant/message', {
     turn,
     step: 1,
@@ -71,6 +75,7 @@ function appendTurn(session: Session, turn: number, userText: string, assistantT
       source: { kind: 'model', provider: 'mock', model: 'mock' },
     }),
   }, { surfaceOp: 'append' })
+  session.append('step/end', { turn, step: 1 })
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
 }
 
@@ -94,10 +99,13 @@ function sessionWithTurns(n: number): Session {
     content: [{ type: 'text', text: 'skills' }], source: { kind: 'plugin', plugin: 'skill-catalog' },
   }), { surfaceOp: 'append' })
   for (let i = 2; i <= n; i += 1) {
-    // Turns 4-6 carry substantial content so the shadowed middle is far
+    // Turn 3 carries git-workflow content the trim directive targets; turns
+    // 4-6 carry substantial login content so the shadowed middle is far
     // larger than the framed checkpoint (marker + guard + summary), keeping
     // the real-model shrink validation meaningful.
-    if (i >= 4 && i <= 6) {
+    if (i === 3) {
+      appendSubstantialTurn(s, i, 'git workflow detail')
+    } else if (i >= 4 && i <= 6) {
       appendSubstantialTurn(s, i, `login flow step ${i}`)
     } else {
       appendTurn(s, i, `task ${i}`, `answer ${i}`)
@@ -148,39 +156,26 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
 
     const s = sessionWithTurns(8)
     const surfaceBefore = s.surface.nodes.length
-    // Real-model behavior is not deterministic: a compaction either shrinks the
-    // span (success + full lifecycle + checkpoint) or the model's summary is
-    // larger than the span and the shrink validation rejects it (summary error
-    // + lifecycle closed + surface unchanged). Both are correct outcomes.
-    //
-    // The shrink-rejected branch is not guaranteed to run on every pass — which
-    // branch executes depends on the model's verbosity on the day. The
-    // DETERMINISTIC shrink-rejection coverage lives in the unit suite
-    // (command.spec.ts, via a content-keyed fake meter); this e2e keeps both
-    // assertions because validating real behavior on either path still matters.
-    let outcome: 'success' | 'shrink-rejected'
-    try {
-      const result = await executeDirectiveCompact(
-        ctx,
-        invocationFor(agentFor(s), 'keep the login details, drop the rest'),
-        CONFIG,
-      )
-      expect(result.kind).toBe('success')
-      if (result.kind !== 'success') return
-      expect(result.text).toContain('per the directive')
-      outcome = 'success'
-    } catch (error: unknown) {
-      // Shrink rejection throws a DirectiveCompactionError; the lifecycle is
-      // still closed and the surface is unchanged.
-      expect(error).toBeInstanceOf(DirectiveCompactionError)
+    // Real-model behavior is not deterministic, but BOTH outcomes are now a
+    // success: the summary shrinks the span (lifecycle + replace + smaller
+    // surface), or the model's output is not smaller and the command reports a
+    // no-change success (lifecycle without replace, surface untouched).
+    const result = await executeDirectiveCompact(
+      ctx,
+      invocationFor(agentFor(s), 'keep the login details, drop the rest'),
+      CONFIG,
+    )
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    if (result.text?.includes('Nothing to compact') === true) {
+      // No-change path: start → summary → end, no replace, surface untouched.
       const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
       const after = s.events.slice(startIdx)
-      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
+      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/summary', 'compaction/end'])
       expect(s.surface.nodes.length).toBe(surfaceBefore)
-      outcome = 'shrink-rejected'
+      return
     }
-    if (outcome === 'shrink-rejected') return
-
+    expect(result.text).toContain('per the directive')
     // Lifecycle appended: start, summary, user/message replace, end.
     const types = s.events.slice(-4).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
@@ -240,30 +235,31 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
 
     const s = sessionWithTurns(8)
     const surfaceBefore = s.surface.nodes.length
-    // Real-model behavior is not fully deterministic, but a trim either
-    // succeeds (lifecycle + checkpoint replacing the dialogue) or the model's
-    // output fails the shrink check (summary error + lifecycle closed). The
-    // injected skeleton must survive either way.
-    try {
-      const result = await executeTrim(
-        ctx,
-        invocationFor(agentFor(s), 'drop all dialogue, keep nothing'),
-      )
-      expect(result.kind).toBe('success')
-      if (result.kind !== 'success') return
-      expect(result.text).toContain('per the requirement')
-      const types = s.events.slice(-4).map(e => e.type)
-      expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
-      // The dialogue is gone; the injected skeleton survives.
-      expect(s.surface.nodes.length).toBeLessThan(surfaceBefore)
-      expect(surfaceText(s)).toContain('rules')
-      expect(surfaceText(s)).toContain('skills')
-    } catch (error: unknown) {
-      expect(error).toBeInstanceOf(DirectiveCompactionError)
+    // Real-model behavior is not fully deterministic, but both outcomes are a
+    // success: the trim shrinks (lifecycle + checkpoint replacing the whole
+    // surface) or the model's output is not smaller and the command reports a
+    // no-change success (lifecycle without replace, surface untouched). P10
+    // full-freedom: the injected skeleton is NOT preserved (it regenerates per
+    // request), so a successful trim shrinks the surface to the checkpoint.
+    const result = await executeTrim(
+      ctx,
+      invocationFor(agentFor(s), 'remove everything about git, keep the rest'),
+    )
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    if (result.text?.includes('Nothing to trim') === true) {
+      // No-change path: start → summary → end, no replace, surface untouched.
       const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
       const after = s.events.slice(startIdx)
-      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
+      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/summary', 'compaction/end'])
       expect(s.surface.nodes.length).toBe(surfaceBefore)
+      return
     }
+    expect(result.text).toContain('per the requirement')
+    const types = s.events.slice(-4).map(e => e.type)
+    expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
+    // The whole surface is replaced by the checkpoint (skeleton included).
+    expect(s.surface.nodes.length).toBeLessThan(surfaceBefore)
+    expect(surfaceText(s)).toContain(trimMarker('remove everything about git, keep the rest'))
   }, 120_000)
 })
