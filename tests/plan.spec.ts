@@ -90,10 +90,10 @@ describe('planCompaction', () => {
   })
 
   it('returns none when the user count is at most head+tail budgets', () => {
-    // freshHead contributes 1 anchor; 5 userTurns 鈫?6 anchors = 3 head + 3 tail, nothing left.
+    // freshHead contributes 1 anchor; 5 userTurns -> 6 anchors = 3 head + 3 tail, nothing left.
     const nodes = [...freshHead(0), ...userTurns(100, 5)]
     expect(planCompaction(nodes, DEFAULT_PLAN_CONFIG).kind).toBe('none')
-    // 4 userTurns 鈫?5 anchors likewise.
+    // 4 userTurns -> 5 anchors likewise.
     const nodes4 = [...freshHead(0), ...userTurns(100, 4)]
     expect(planCompaction(nodes4, DEFAULT_PLAN_CONFIG).kind).toBe('none')
   })
@@ -139,7 +139,7 @@ describe('planCompaction', () => {
 
   it('primary: configurable budgets keep 1 head and 1 tail user', () => {
     const config: PlanConfig = { keepHeadUsers: 1, keepTailUsers: 1 }
-    // freshHead (1 anchor) + 3 userTurns 鈫?4 anchors: head=u0, middle=u1/u2, tail=u3.
+    // freshHead (1 anchor) + 3 userTurns -> 4 anchors: head=u0, middle=u1/u2, tail=u3.
     const nodes = [...freshHead(0), ...userTurns(100, 3)]
     const plan = planCompaction(nodes, config)
     expect(plan.kind).toBe('primary')
