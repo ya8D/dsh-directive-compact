@@ -18,9 +18,10 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 
 ## P1 — Planning (range selection)
 
-- [ ] `src/plan.ts` — `findHeadBoundary` (fixed-skeleton head = nodes before the first `assistant/message` or `tool/result`), `splitTurns` (user + assistant + tool results per turn), `selectMiddle` (head/tail boundaries, balance-checked with `toolPairingBalancedBefore/After`), dual-path selection (primary vs degraded)
-- [ ] Unit tests: head boundary (fresh session, compacted session, empty), turn splitting, middle selection, balance boundaries, dual-path choice
-- [ ] Typecheck + build green
+- [x] `src/plan.ts` — `headBoundaryIndex` (leading skeleton = compact checkpoint + injected nodes before the first user), `splitTurns` (retained for P3 balance checks), `planCompaction` (anchored on surface user utterances; keep head `keepHeadUsers` + tail `keepTailUsers` user turns verbatim, summarize the middle; defaults 3/3 via `PlanConfig`)
+- [x] Unit tests: head boundary (fresh, compacted, empty), user-anchor splitting, middle selection, tail floor (last-user and in-flight flow preserved), configurable budgets, repeated-compaction (compact checkpoint absorbed into the skeleton)
+- [x] Real-session verification: ran `planCompaction` over a twice-compacted session (101 log turn markers, 57 live surface user anchors) — head/middle/tail split correct, last user in tail; verified surface anchors, not turn markers, stay correct across compaction
+- [x] Typecheck + build green (22 tests pass)
 
 ## P2 — Summarization
 
