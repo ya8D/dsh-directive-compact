@@ -4,7 +4,6 @@ import {
   isUserUtterance,
   planCompaction,
   skeletonEndIndex,
-  splitTurns,
   type PlanConfig,
   type SurfaceNodeInfo,
 } from '../src/plan.ts'
@@ -81,28 +80,6 @@ describe('skeletonEndIndex', () => {
       node(2, 'assistant/message'),
     ]
     expect(skeletonEndIndex(nodes)).toBe(0)
-  })
-})
-
-describe('splitTurns', () => {
-  it('splits conversation into user-led turns', () => {
-    const conversation = [...userTurn(10), ...userTurn(20)]
-    const turns = splitTurns(conversation)
-    expect(turns).toEqual([[0, 1, 2], [3, 4, 5]])
-  })
-  it('starts a turn on a leading non-user node', () => {
-    const conversation = [node(1, 'assistant/message'), node(2, 'tool/result')]
-    expect(splitTurns(conversation)).toEqual([[0, 1]])
-  })
-  it('keeps tool results with their assistant message', () => {
-    const conversation = [
-      node(0, 'user/message', 'user'),
-      node(1, 'assistant/message'),
-      node(2, 'tool/result'),
-      node(3, 'assistant/message'),
-      node(4, 'tool/result'),
-    ]
-    expect(splitTurns(conversation)).toEqual([[0, 1, 2, 3, 4]])
   })
 })
 

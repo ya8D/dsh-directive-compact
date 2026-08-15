@@ -90,31 +90,6 @@ export function skeletonEndIndex(nodes: readonly SurfaceNodeInfo[]): number {
 }
 
 /**
- * Split conversation nodes (after the head) into turns. A turn starts at a
- * `user/message` (a genuine utterance) and runs through the following
- * `assistant/message` and `tool/result` nodes until the next user utterance.
- * A leading run of non-user nodes (e.g. a continuing assistant stream after a
- * resumed surface) starts a turn on its own so nothing is dropped.
- *
- * Retained for the command layer's balance-boundary checks (P3) and for
- * tests; `planCompaction` anchors on user-utterance indexes directly.
- * @param nodes - surface nodes after the head, in order.
- * @returns one array of node indices per turn.
- */
-export function splitTurns(nodes: readonly SurfaceNodeInfo[]): number[][] {
-  const turns: number[][] = []
-  for (let index = 0; index < nodes.length; index += 1) {
-    const node = nodes[index]!
-    if (node.type === 'user/message' || turns.length === 0) {
-      turns.push([index])
-    } else {
-      turns[turns.length - 1]!.push(index)
-    }
-  }
-  return turns
-}
-
-/**
  * Build the compaction plan for one directive-driven compaction.
  *
  * User utterances on the surface are the anchors. The skeleton (leading
@@ -135,7 +110,7 @@ export function splitTurns(nodes: readonly SurfaceNodeInfo[]): number[][] {
  * Invariant: a `primary` plan's `tailSeqs` is non-empty and includes every
  * node from the `keepTailUsers`-from-last user utterance on; the middle never
  * splits an open tool pair (boundaries fall at user utterances, which are
- * balanced cuts; the command layer re-checks with the session's pairing API).
+ * balanced cuts).
  * @param nodes - surface nodes in order.
  * @param config - head/tail user-turn budgets.
  * @returns the plan to execute.
