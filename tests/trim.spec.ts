@@ -152,12 +152,12 @@ function agentFor(session: Session): Agent {
   } as unknown as Agent
 }
 
-function invocationFor(agent: Agent, rawInput: string): CommandInvocation {
+function invocationFor(agent: Agent, rawInput: string, signal: AbortSignal = new AbortController().signal): CommandInvocation {
   return {
     commandId: 'trim-1' as unknown as CommandId,
     agent,
     rawInput,
-    signal: new AbortController().signal,
+    signal,
   }
 }
 
@@ -355,6 +355,81 @@ describe('executeTrim', () => {
       .rejects.toThrow()
     expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
     expect(s.surface.nodes).toEqual(surfaceBefore)
+  })
+
+  it('P8 retry: a transient chunk failure retries and succeeds', async () => {
+    const s = sessionWithTurns(5)
+    const before = s.events.length
+    // First stream call fails (transient network), the retry succeeds.
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          if (streamCalls === 1) throw new Error('network hiccup')
+          yield TRIM_CHUNKS[0]!
+          yield TRIM_CHUNKS[1]!
+          yield TRIM_CHUNKS[2]!
+          yield TRIM_CHUNKS[3]!
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    expect(streamCalls).toBe(2) // 1 initial + 1 retry
+    const types = s.events.slice(before).map(e => e.type)
+    expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
+  })
+
+  it('P8 retry: gives up after 3 attempts when the chunk keeps failing', async () => {
+    const s = sessionWithTurns(5)
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          throw new Error('persistent failure')
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all')))
+      .rejects.toThrow(DirectiveCompactionError)
+    expect(streamCalls).toBe(3) // 1 initial + 2 retries
+    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
+  })
+
+  it('P8 retry: aborts during the first attempt and never starts a retry', async () => {
+    const s = sessionWithTurns(5)
+    let streamCalls = 0
+    const controller = new AbortController()
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          // Abort on the first attempt; the retry loop must see signal.aborted
+          // and stop without a second call.
+          controller.abort()
+          throw new Error('aborted')
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    await expect(executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all', controller.signal)))
+      .rejects.toThrow(DirectiveCompactionError)
+    expect(streamCalls).toBe(1) // no retry after abort
+    // Lifecycle closed with an error; no replacement landed.
+    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
   })
 
   it('P8: splits a large surface into parallel chunks and assembles [part N/M]', async () => {

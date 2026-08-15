@@ -21,12 +21,13 @@ import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { Session } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 // Type-only: activates the `ctx.tokenMeter` declaration on the Cordis context.
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { summarizeWithDirective } from './summarizer.js'
+import type { DirectiveSummaryResult, DirectiveTarget } from './summarizer.js'
 import { CHECKPOINT_GUARD } from './summarizer.js'
-import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, type PricedTrimNode } from './trim.js'
+import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, type PricedTrimNode, type TrimBudget } from './trim.js'
 import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget, surfaceNodes } from './command.js'
 
 /**
@@ -186,20 +187,24 @@ export async function executeTrim(
     // Summarize every chunk in parallel. Each chunk is a full trim call over
     // its own rendered span; HTTP 429 rate limits are retried by the adapter's
     // retryPolicy. All chunks share the same directive and marker.
+    //
+    // Per-chunk retry: a transient failure on ONE chunk (network hiccup,
+    // proxy switch, adapter 5xx) must not sink the whole trim. Each chunk gets
+    // up to 3 attempts (1 initial + 2 retries); cancellation and abort are
+    // never retried.
     const chunkResults = await Promise.all(chunks.map(async (chunk, index) => {
       const chunkMessages: Message[] = chunk.seqs.flatMap((seq) => {
         const event = session.events[seq]
         return event === undefined ? [] : (session.deriveEventMessage(event) === null ? [] : [session.deriveEventMessage(event)!])
       })
-      const result = await summarizeWithDirective(
+      const result = await summarizeChunkWithRetry(
         ctx,
-        { ...target, maxTokens: budget.maxTokens },
+        target,
+        budget,
         chunkMessages,
         directive,
         session.id,
         invocation.signal,
-        buildTrimPrompt,
-        trimMarker,
       )
       return { result, index }
     }))
@@ -278,6 +283,65 @@ export async function executeTrim(
     }
     throw new DirectiveCompactionError('summary', String(error))
   }
+}
+
+/**
+ * Summarize one trim chunk with bounded retries.
+ *
+ * A transient failure on one chunk (network hiccup, proxy switch, adapter
+ * 5xx) retries the SAME chunk content up to 2 extra times (3 attempts total)
+ * before giving up, so a single flaky call cannot sink a whole parallel trim.
+ * Cancellation and aborted signals are never retried — they propagate
+ * immediately.
+ *
+ * Retry policy: any non-`DirectiveCompactionError` throw is retried, including
+ * a `MAX_TOKENS` truncation. That is a deliberate trade: the budget already
+ * derives maxTokens from the window (256K on deepseek), so deterministic
+ * truncation is rare, while a transient failure that truncates mid-stream is
+ * worth retrying. Expected compaction failures (shrink, cancelled) never
+ * retry.
+ * @param ctx - context providing the LLM service.
+ * @param target - resolved provider/model pair.
+ * @param budget - window-derived budget (maxTokens applied per call).
+ * @param messages - this chunk's messages, in surface order.
+ * @param directive - the user's trim requirement.
+ * @param sessionId - owning session id for request routing.
+ * @param signal - cancellation signal; retries stop when it aborts.
+ * @returns the summarization result from the first successful attempt.
+ */
+async function summarizeChunkWithRetry(
+  ctx: Context,
+  target: DirectiveTarget,
+  budget: TrimBudget,
+  messages: readonly Message[],
+  directive: string,
+  sessionId: SessionId,
+  signal: AbortSignal,
+): Promise<DirectiveSummaryResult> {
+  const attempts = 3 // 1 initial + 2 retries
+  let lastError: unknown
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (signal.aborted) throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
+    try {
+      return await summarizeWithDirective(
+        ctx,
+        { ...target, maxTokens: budget.maxTokens },
+        messages,
+        directive,
+        sessionId,
+        signal,
+        buildTrimPrompt,
+        trimMarker,
+      )
+    } catch (error: unknown) {
+      lastError = error
+      if (signal.aborted) throw error
+      // Non-retryable: expected directive-compaction failures (shrink etc.)
+      // are not transient network issues.
+      if (error instanceof DirectiveCompactionError) throw error
+    }
+  }
+  throw lastError
 }
 
 /** Sum disjoint provider usage buckets across chunk calls. */
