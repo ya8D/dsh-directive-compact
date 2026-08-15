@@ -18,7 +18,7 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 
 ## P1 — Planning (range selection)
 
-- [x] `src/plan.ts` — `headBoundaryIndex` (leading skeleton = compact checkpoint + injected nodes before the first user), `splitTurns` (retained for P3 balance checks), `planCompaction` (anchored on surface user utterances; keep head `keepHeadUsers` + tail `keepTailUsers` user turns verbatim, summarize the middle; defaults 3/3 via `PlanConfig`)
+- [x] `src/plan.ts` — `skeletonEndIndex` (leading skeleton = compact checkpoint + injected nodes before the first user), `planCompaction` (anchored on surface user utterances; keep head `keepHeadUsers` + tail `keepTailUsers` user turns verbatim, summarize the middle; defaults 3/3 via `PlanConfig`)
 - [x] Unit tests: head boundary (fresh, compacted, empty), user-anchor splitting, middle selection, tail floor (last-user and in-flight flow preserved), configurable budgets, repeated-compaction (compact checkpoint absorbed into the skeleton)
 - [x] Real-session verification: ran `planCompaction` over a twice-compacted session (101 log turn markers, 57 live surface user anchors) — head/middle/tail split correct, last user in tail; verified surface anchors, not turn markers, stay correct across compaction
 - [x] Typecheck + build green (22 tests pass)
@@ -44,14 +44,14 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 
 ## P5 — Bundle + verification
 
-- [ ] `--dump-config` verification of the inserted bundle row
-- [ ] With-key e2e: real DeepSeek model, self-skips without a key
+- [x] `--dump-config` verification of the inserted bundle row
+- [x] With-key e2e: real DeepSeek model, self-skips without a key
 
 ## P6 — Documentation
 
-- [ ] README final pass against shipped behavior
-- [ ] Known Limitations current (before/after log-only, middle-span savings only, implementation status)
-- [ ] This TODO fully checked off, DONE current
+- [x] README final pass against shipped behavior (single-path design, bundle install verified, implementation status)
+- [x] Known Limitations current (no before/after rendering, middle-span savings only, clean-call summarization, implementation status)
+- [x] This TODO fully checked off, DONE current
 
 ## Deferred / optional
 
