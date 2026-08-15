@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  headBoundaryIndex,
-  isInjectedSystemNode,
+  DEFAULT_PLAN_CONFIG,
   isUserUtterance,
   planCompaction,
+  skeletonEndIndex,
   splitTurns,
   type PlanConfig,
   type SurfaceNodeInfo,
@@ -40,8 +40,6 @@ function userTurns(start: number, count: number): SurfaceNodeInfo[] {
   return out
 }
 
-const DEFAULT: PlanConfig = { keepHeadUsers: 3, keepTailUsers: 3 }
-
 describe('isUserUtterance', () => {
   it('accepts a genuine user message', () => {
     expect(isUserUtterance(node(1, 'user/message', 'user'))).toBe(true)
@@ -57,30 +55,14 @@ describe('isUserUtterance', () => {
   })
 })
 
-describe('isInjectedSystemNode', () => {
-  it('accepts every non-user-sourced user/message', () => {
-    expect(isInjectedSystemNode(node(1, 'user/message', 'agent-instructions'))).toBe(true)
-    expect(isInjectedSystemNode(node(1, 'user/message', '@deepseek-ai/dsh-system-prompt'))).toBe(true)
-    expect(isInjectedSystemNode(node(1, 'user/message', 'skill-catalog'))).toBe(true)
-    expect(isInjectedSystemNode(node(1, 'user/message', 'compact'))).toBe(true)
-  })
-  it('rejects a genuine user message', () => {
-    expect(isInjectedSystemNode(node(1, 'user/message', 'user'))).toBe(false)
-  })
-  it('rejects non-user message types', () => {
-    expect(isInjectedSystemNode(node(1, 'assistant/message'))).toBe(false)
-    expect(isInjectedSystemNode(node(1, 'tool/result'))).toBe(false)
-  })
-})
-
-describe('headBoundaryIndex', () => {
+describe('skeletonEndIndex', () => {
   it('returns 0 (the first user index) in a fresh session', () => {
     const nodes = [...freshHead(0), ...userTurn(10)]
-    expect(headBoundaryIndex(nodes)).toBe(0)
+    expect(skeletonEndIndex(nodes)).toBe(0)
   })
   it('returns nodes.length when no user utterance exists', () => {
-    expect(headBoundaryIndex([node(1, 'assistant/message')])).toBe(1)
-    expect(headBoundaryIndex([])).toBe(0)
+    expect(skeletonEndIndex([node(1, 'assistant/message')])).toBe(1)
+    expect(skeletonEndIndex([])).toBe(0)
   })
   it('returns the user index after a leading compact checkpoint and injections', () => {
     const nodes = [
@@ -90,7 +72,7 @@ describe('headBoundaryIndex', () => {
       node(3, 'user/message', 'skill-catalog'),
       node(4, 'user/message', 'user'),
     ]
-    expect(headBoundaryIndex(nodes)).toBe(4)
+    expect(skeletonEndIndex(nodes)).toBe(4)
   })
   it('returns 0 when the user utterance leads and injections follow it', () => {
     const nodes = [
@@ -98,7 +80,7 @@ describe('headBoundaryIndex', () => {
       node(1, 'user/message', 'skill-catalog'),
       node(2, 'assistant/message'),
     ]
-    expect(headBoundaryIndex(nodes)).toBe(0)
+    expect(skeletonEndIndex(nodes)).toBe(0)
   })
 })
 
@@ -127,21 +109,21 @@ describe('splitTurns', () => {
 describe('planCompaction', () => {
   it('returns none for a surface with only the skeleton and no user turn', () => {
     // freshHead: user0 + 3 injections, but no assistant/tool content.
-    expect(planCompaction(freshHead(0), DEFAULT).kind).toBe('none')
+    expect(planCompaction(freshHead(0), DEFAULT_PLAN_CONFIG).kind).toBe('none')
   })
 
   it('returns none when the user count is at most head+tail budgets', () => {
-    // freshHead contributes 1 anchor; 5 userTurns → 6 anchors = 3 head + 3 tail, nothing left.
+    // freshHead contributes 1 anchor; 5 userTurns 鈫?6 anchors = 3 head + 3 tail, nothing left.
     const nodes = [...freshHead(0), ...userTurns(100, 5)]
-    expect(planCompaction(nodes, DEFAULT).kind).toBe('none')
-    // 4 userTurns → 5 anchors likewise.
+    expect(planCompaction(nodes, DEFAULT_PLAN_CONFIG).kind).toBe('none')
+    // 4 userTurns 鈫?5 anchors likewise.
     const nodes4 = [...freshHead(0), ...userTurns(100, 4)]
-    expect(planCompaction(nodes4, DEFAULT).kind).toBe('none')
+    expect(planCompaction(nodes4, DEFAULT_PLAN_CONFIG).kind).toBe('none')
   })
 
   it('primary: 7 userTurns (8 anchors) keeps head(3) + middle(2) + tail(3)', () => {
     const nodes = [...freshHead(0), ...userTurns(100, 7)]
-    const plan = planCompaction(nodes, DEFAULT)
+    const plan = planCompaction(nodes, DEFAULT_PLAN_CONFIG)
     expect(plan.kind).toBe('primary')
     if (plan.kind !== 'primary') return
     // Head = user0 + injections + user1/user2 turns (0..3, 100..112);
@@ -153,7 +135,7 @@ describe('planCompaction', () => {
 
   it('primary: 10 userTurns (11 anchors) keeps head(3) + middle(5) + tail(3)', () => {
     const nodes = [...freshHead(0), ...userTurns(100, 10)]
-    const plan = planCompaction(nodes, DEFAULT)
+    const plan = planCompaction(nodes, DEFAULT_PLAN_CONFIG)
     expect(plan.kind).toBe('primary')
     if (plan.kind !== 'primary') return
     // Head = user0 + injections + user1/user2 (0..3, 100..112);
@@ -170,7 +152,7 @@ describe('planCompaction', () => {
       ...userTurns(100, 7),
       node(200, 'assistant/message'), // in-flight, no tool result yet
     ]
-    const plan = planCompaction(nodes, DEFAULT)
+    const plan = planCompaction(nodes, DEFAULT_PLAN_CONFIG)
     expect(plan.kind).toBe('primary')
     if (plan.kind !== 'primary') return
     expect(plan.headSeqs).toEqual([0, 1, 2, 3, 100, 101, 102, 110, 111, 112])
@@ -180,7 +162,7 @@ describe('planCompaction', () => {
 
   it('primary: configurable budgets keep 1 head and 1 tail user', () => {
     const config: PlanConfig = { keepHeadUsers: 1, keepTailUsers: 1 }
-    // freshHead (1 anchor) + 3 userTurns → 4 anchors: head=u0, middle=u1/u2, tail=u3.
+    // freshHead (1 anchor) + 3 userTurns 鈫?4 anchors: head=u0, middle=u1/u2, tail=u3.
     const nodes = [...freshHead(0), ...userTurns(100, 3)]
     const plan = planCompaction(nodes, config)
     expect(plan.kind).toBe('primary')
@@ -203,7 +185,7 @@ describe('planCompaction', () => {
       node(3, 'user/message', 'skill-catalog'),
       ...userTurns(100, 7),
     ]
-    const plan = planCompaction(nodes, DEFAULT)
+    const plan = planCompaction(nodes, DEFAULT_PLAN_CONFIG)
     expect(plan.kind).toBe('primary')
     if (plan.kind !== 'primary') return
     // Skeleton (0..3) + user0-2 turns (100..122); middle = user3 turn (130..132);
@@ -219,10 +201,10 @@ describe('planCompaction', () => {
       node(1, 'assistant/message'),
       node(2, 'tool/result'),
     ]
-    expect(planCompaction(nodes, DEFAULT).kind).toBe('none')
+    expect(planCompaction(nodes, DEFAULT_PLAN_CONFIG).kind).toBe('none')
   })
 
   it('none: empty surface', () => {
-    expect(planCompaction([], DEFAULT).kind).toBe('none')
+    expect(planCompaction([], DEFAULT_PLAN_CONFIG).kind).toBe('none')
   })
 })

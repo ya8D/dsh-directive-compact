@@ -52,6 +52,15 @@ export interface PlanConfig {
 }
 
 /**
+ * Default head/tail budgets. The single source the command layer (P3) and
+ * tests both use, so production defaults cannot drift from test expectations.
+ */
+export const DEFAULT_PLAN_CONFIG: PlanConfig = {
+  keepHeadUsers: 3,
+  keepTailUsers: 3,
+}
+
+/**
  * Whether a node is a genuine user utterance (not an injected system node).
  * @param node - the surface node to test.
  * @returns true when the node is a `user/message` whose source kind is `user`.
@@ -61,22 +70,8 @@ export function isUserUtterance(node: SurfaceNodeInfo): boolean {
 }
 
 /**
- * Whether a node is an injected system node rather than a genuine user
- * utterance. Every non-`user`-sourced `user/message` is injection: the
- * `agent-instructions`, `system-prompt`, and `skill-catalog` nodes that open a
- * session, plus an older `compact` checkpoint after a previous compaction.
- * Deliberately not an enumeration of source kinds — the upstream set may grow
- * or rename, and any injection must stay in the preserved head.
- * @param node - the surface node to test.
- * @returns true when the node is a non-user-sourced `user/message`.
- */
-export function isInjectedSystemNode(node: SurfaceNodeInfo): boolean {
-  return node.type === 'user/message' && node.kind !== 'user'
-}
-
-/**
- * Index of the first user utterance — the boundary between the fixed-skeleton
- * head and the conversation. The skeleton is the leading injected system nodes
+ * Index of the first user utterance — the end of the skeleton, where the
+ * conversation begins. The skeleton is the leading injected system nodes
  * (including an older `compact` checkpoint after a previous compaction) that
  * precede the first user utterance; the user utterance itself starts the
  * conversation and serves as the first anchor.
@@ -89,7 +84,7 @@ export function isInjectedSystemNode(node: SurfaceNodeInfo): boolean {
  * @returns the index of the first user utterance; `nodes.length` when the
  *   surface has no user utterance at all.
  */
-export function headBoundaryIndex(nodes: readonly SurfaceNodeInfo[]): number {
+export function skeletonEndIndex(nodes: readonly SurfaceNodeInfo[]): number {
   const firstUser = nodes.findIndex(isUserUtterance)
   return firstUser === -1 ? nodes.length : firstUser
 }
@@ -149,9 +144,9 @@ export function planCompaction(
   nodes: readonly SurfaceNodeInfo[],
   config: PlanConfig,
 ): CompactionPlan {
-  const headEnd = headBoundaryIndex(nodes)
-  const skeleton = nodes.slice(0, headEnd)
-  const conversation = nodes.slice(headEnd)
+  const skeletonEnd = skeletonEndIndex(nodes)
+  const skeleton = nodes.slice(0, skeletonEnd)
+  const conversation = nodes.slice(skeletonEnd)
   const userIndexes: number[] = []
   for (let index = 0; index < conversation.length; index += 1) {
     if (isUserUtterance(conversation[index]!)) userIndexes.push(index)
