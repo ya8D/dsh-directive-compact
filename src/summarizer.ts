@@ -207,7 +207,18 @@ export async function summarizeWithDirective(
     ...signal === undefined ? {} : { signal },
   }
   const assembler = new BlockAssembler()
-  for await (const chunk of ctx.llm.stream(options)) assembler.push(chunk)
+  const startedAt = Date.now()
+  let firstChunkAt: number | undefined
+  for await (const chunk of ctx.llm.stream(options)) {
+    if (firstChunkAt === undefined) firstChunkAt = Date.now()
+    assembler.push(chunk)
+  }
+  const streamMs = Date.now() - startedAt
+  const ttftMs = firstChunkAt === undefined ? streamMs : firstChunkAt - startedAt
+  ctx.logger('dsh-directive-compact').debug(
+    'directive summarization: first chunk in %dms, stream done in %dms',
+    ttftMs, streamMs,
+  )
   const finishError = summarizationError(assembler.finish)
   if (finishError !== undefined) throw finishError
 

@@ -8,6 +8,7 @@ import { executeDirectiveCompact, resolveDirectiveTarget, surfaceNodes, Directiv
 import type { CommandConfig } from '../src/command.js'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+import { createLoggerStub } from './helpers.js'
 
 const CONFIG: CommandConfig = {
   keepHeadUsers: 3,
@@ -74,7 +75,7 @@ function invocationFor(agent: Agent, rawInput: string): CommandInvocation {
 }
 
 /** A fake context whose `llm.stream` yields the given chunks. */
-function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm' | 'tokenMeter'> {
+function fakeCtx(chunks: readonly StreamChunk[], logger?: Context['logger']): Pick<Context, 'llm' | 'tokenMeter' | 'logger'> {
   return {
     llm: {
       async *stream(): AsyncIterable<StreamChunk> {
@@ -84,7 +85,8 @@ function fakeCtx(chunks: readonly StreamChunk[]): Pick<Context, 'llm' | 'tokenMe
     tokenMeter: {
       estimateMessage: () => 10,
     } as unknown as Context['tokenMeter'],
-  } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    logger: logger ?? createLoggerStub().logger,
+  } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
 }
 
 const SUMMARY_CHUNKS: StreamChunk[] = [
@@ -205,7 +207,8 @@ describe('executeDirectiveCompact', () => {
         },
       },
       tokenMeter: { estimateMessage: () => 10 },
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     await expect(executeDirectiveCompact(ctx as never, invocationFor(agentFor(s), 'keep x'), CONFIG))
       .rejects.toThrow()
     // Lifecycle closed with an error, but no surface replacement was made.
@@ -242,7 +245,7 @@ describe('executeDirectiveCompact', () => {
     expect(s.events.length).toBe(before)
   })
 
-  it('P7: rejects a checkpoint that does not shrink the shadowed span', async () => {
+  it('treats an unshrunk checkpoint as a no-change success (nothing to compact)', async () => {
     const s = sessionWithTurns(8)
     const userMessagesBefore = s.events.filter(e => e.type === 'user/message').length
     const ctx = fakeCtx(SUMMARY_CHUNKS)
@@ -258,11 +261,54 @@ describe('executeDirectiveCompact', () => {
           return text.includes('[Directive-driven compaction checkpoint') ? 1000 : 10
         },
       },
-    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
-    await expect(executeDirectiveCompact(inflated as never, invocationFor(agentFor(s), 'keep x'), CONFIG))
-      .rejects.toThrow(DirectiveCompactionError)
-    // The lifecycle is still closed with the error, and no replace landed.
-    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
+      logger: ctx.logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeDirectiveCompact(inflated as never, invocationFor(agentFor(s), 'keep x'), CONFIG)
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(result.text).toContain('Nothing to compact')
+    // Lifecycle start → summary → end with NO user/message replace; the
+    // surface is untouched and the end is a success (no error).
+    const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
+    const after = s.events.slice(startIdx).map(e => e.type)
+    expect(after).toEqual(['compaction/start', 'compaction/summary', 'compaction/end'])
     expect(s.events.filter(e => e.type === 'user/message').length).toBe(userMessagesBefore)
+    expect((s.events[s.events.length - 1]!.data as { error?: string }).error).toBeUndefined()
+  })
+
+  it('logs phase milestones with timings on success', async () => {
+    const s = sessionWithTurns(8)
+    const stub = createLoggerStub()
+    const result = await executeDirectiveCompact(
+      fakeCtx(SUMMARY_CHUNKS, stub.logger) as never,
+      invocationFor(agentFor(s), 'keep the login flow'),
+      CONFIG,
+    )
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    const info = stub.records.filter(r => r.level === 'info').map(r => r.args.join(' '))
+    // Begin names the directive (truncated), the surface, and the plan.
+    const begin = info.find(m => m.includes('compact-directive: begin'))
+    expect(begin).toBeDefined()
+    expect(begin).toContain('keep the login flow')
+    expect(begin).toContain('surface')
+    expect(begin).toContain('middle')
+    // Summarization and commit report durations.
+    expect(info.some(m => m.includes('compact-directive: summarization done in') && m.includes('ms'))).toBe(true)
+    expect(info.some(m => m.includes('compact-directive: committed') && m.includes('ms total'))).toBe(true)
+  })
+
+  it('logs a warning with the failure reason and duration', async () => {
+    const s = sessionWithTurns(8)
+    const stub = createLoggerStub()
+    await expect(executeDirectiveCompact(
+      fakeCtx([
+        { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'E' } } } as StreamChunk,
+      ], stub.logger) as never,
+      invocationFor(agentFor(s), 'keep x'),
+      CONFIG,
+    )).rejects.toThrow(DirectiveCompactionError)
+    const warns = stub.records.filter(r => r.level === 'warn').map(r => r.args.join(' '))
+    expect(warns.some(m => m.includes('compact-directive: failed') && m.includes('boom'))).toBe(true)
   })
 })

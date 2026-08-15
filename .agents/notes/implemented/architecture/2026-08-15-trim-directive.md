@@ -10,20 +10,20 @@ An earlier P6 iteration shipped a keyword/regex hit-mapping trim (`compileTrimPa
 
 ## Decision
 
-**`/trim-directive <requirement>` sends the trim-able conversation to the model with a directive-only prompt, and replaces the whole trim range with the model's output as one checkpoint.** No head, no tail, no dialogue-region protection.
+**`/trim-directive <requirement>` sends the ENTIRE surface to the model with a directive-only prompt, and replaces it with the model's output as one checkpoint.** No head, no tail, no system-node protection — full freedom (user-confirmed, P10).
 
-### The trim range: after the injected system nodes
+### Full-freedom range
 
-A DeepSeek Harness session opens with the first user message followed by the injected `agent-instructions` / `system-prompt` / `skill-catalog` nodes; they are injected once, are never re-injected after a replacement, and carry the model's environment. They are session machinery, not dialogue, so they must survive a trim. Because a surface `replace` shadows one contiguous range and the injected nodes sit between the first user message and the rest of the conversation, the only range that keeps every injected node outside the replacement is the span **after the last injected node** through the surface tail. The opening anchor (first user message) stays outside the range as a structural consequence of that contiguity, not as a protection policy.
+The trim range is the whole surface (`surface[0]..surface[last]`). The injected skeleton (`agent-instructions` / `system-prompt` / `skill-catalog`) and any `compact` checkpoint are trim-able like any other node. This is safe because:
 
-Three guards keep system nodes out of harm's way:
-1. **Render exclusion** — the prompt text is built only from nodes after the last injected node (`isInjectedSystemNode` classifies `user/message` events whose source kind is not `user`).
-2. **Range exclusion** — the `replace` starts at the first node after the last injected node.
-3. **Session validation backstop** — if a range ever did cover an uncovered injected node, `sourceEventSeqs` would omit it and the session's append validation fails loud (`must include every shadowed surface node`).
+- **The skeleton regenerates per request.** The agent loop re-injects system context on every step: `preStep` calls `systemPrompt.assemble()` and projects the result as a context message (agent-loop `agent.ts`), and `agent-instructions` composes its workspace instructions into `agent/pre-step` request messages. Deleting the surface copies does not remove the model's environment — the next request re-creates it.
+- **A `compact` checkpoint's content survives in the append-only log**, recoverable by tooling.
+
+An earlier design protected the skeleton (render + range exclusion after the last injected node); a real forked/compacted session showed that rule mis-located the trim start (a `compact` checkpoint at `surface[0]`, skeleton re-injected mid-conversation) and protected nodes that regenerate anyway. The only constraint kept is tool-pairing balance (`toolPairingBalancedBefore`/`After`), a session-integrity requirement — a replace cannot split a tool-call/result pair.
 
 ### Directive-only prompt
 
-The prompt is `TRIM_INSTRUCTION` + the requirement verbatim + the rendered dialogue. There is no four-point baseline: unlike `/compact-directive`, the trim imposes no "keep task goal / findings / next step" floor — the user's requirement is the sole instruction (the ContextForge `compact_by_directive` shape). The requirement passes through unmodified; the model decides what survives.
+The prompt is `TRIM_INSTRUCTION` + the requirement verbatim + the rendered surface. There is no four-point baseline: unlike `/compact-directive`, the trim imposes no "keep task goal / findings / next step" floor — the user's requirement is the sole instruction (the ContextForge `compact_by_directive` shape). The requirement passes through unmodified; the model decides what survives.
 
 ### Summarizing lifecycle, not the model-free prune
 
@@ -45,12 +45,12 @@ The first P6 iteration. Deterministic and testable, but it matches text literall
 
 ### Keep ContextForge's head protection (first user message always kept)
 
-`compact_by_directive` preserves `messages[0]`. Here the opening anchor is preserved anyway as the structural consequence of the system-node range exclusion, but the trim makes no *additional* head guarantee and no tail guarantee — the entire post-skeleton conversation is trim-able.
+`compact_by_directive` preserves `messages[0]`. Rejected for full freedom: the trim's purpose is complete control, and the opening anchor is not structurally special once the skeleton regenerates per request.
 
-### Whole-surface replace including injected nodes
+### Protect the injected skeleton (render + range exclusion)
 
-Replacing the injected nodes with the model's output would make the next request lose the system prompt, tool catalog, and skill list — and they are not re-injected. Rejected on the model-visible ⟺ reconstructable principle.
+The original P6 design. Rejected after a real forked/compacted session: the rule started the trim after the LAST injected node, but automatic compaction folds the original skeleton into a `compact` checkpoint at `surface[0]` and the skeleton is re-injected mid-conversation — so the rule either missed trim-able dialogue or protected nodes that regenerate per request anyway (verified in agent-loop `preStep` and agent-instructions `agent/pre-step`).
 
 ## Consequences
 
-The command is the second global command in the plugin, sharing the draining handler wrapper and error translation. A trim lands one summarize call and one lifecycle; the session log records the standard compaction events so the operation is reconstructable. Because the dialogue is trim-able down to nothing (only the injected skeleton and the checkpoint remain), a broad requirement can strip the task anchor — that is the point of the command, documented in the README.
+The command is the second global command in the plugin, sharing the draining handler wrapper and error translation. A trim lands one summarize call and one lifecycle; the session log records the standard compaction events so the operation is reconstructable. Because the whole surface is trim-able down to nothing, a broad requirement can strip the session to just the checkpoint — the model's environment (skeleton) regenerates on the next request, and the stripped content stays recoverable in the append-only log. That is the point of the command, documented in the README.

@@ -41,6 +41,18 @@ export function trimMarker(directive: string): string {
   return `[Directive trim, per requirement: ${directive}]`
 }
 
+/**
+ * Fixed per-chunk input cap (heuristic tokens; the meter prices ~4 chars/token,
+ * so ≈200K rendered chars per chunk). The plugin targets the 1M-window
+ * DeepSeek models. 50K keeps one summarization call fast and independently
+ * retriable, where a single ~200K-token call can take 10+ minutes or hang
+ * (observed on a real 178K-token session).
+ */
+const TRIM_CHUNK_INPUT_BUDGET = 50_000
+
+/** Hard cap on chunk count: 20 × 50K = 1M = the full 1M window. */
+const TRIM_MAX_CHUNKS = 20
+
 /** One token-priced surface node, as the chunker slices on. */
 export interface PricedTrimNode {
   /** Event seq of the surface node. */
@@ -53,31 +65,33 @@ export interface PricedTrimNode {
 export interface TrimBudget {
   /** Per-call output cap: min(contextWindow/2, adapter max output tokens). */
   readonly maxTokens: number
-  /** Per-chunk input cap: contextWindow/4. */
+  /** Per-chunk input cap: fixed 50K heuristic tokens (targets the 1M window). */
   readonly chunkInputBudget: number
-  /** Hard cap on chunk count (worst-case fragmentation bound). */
+  /** Hard cap on chunk count: 20 × 50K = 1M = the 1M window. */
   readonly maxChunks: number
 }
 
 /**
- * Resolve the summarization budget from the routed model's context window.
+ * Resolve the summarization budget for the trim.
  *
- * The window is the MAXIMUM COMBINED request + response token capacity
- * (`LlmModelContext.contextWindow`), so every number is derived from it:
- * - output cap = min(window/2, adapter max output) — half the window for the
- *   response, but never above the adapter's hard per-response limit (256K for
- *   deepseek); reasoning tokens count toward this cap, so the model's thinking
- *   shares it with the visible output;
- * - per-chunk input = window/5 — a chunk occupies input + output <=
- *   window/5 + window/2, leaving headroom for token-meter estimation error and
- *   request overhead, and keeping the output cap able to rewrite the input
- *   when thinking consumes up to ~56K of the 256K;
- * - max chunks = 10 — the worst-case fragmentation bound over the real
- *   1,000,000-token window: a single very large node (e.g. ~101K, over half
- *   the chunk budget) can fill a chunk alone, so 10 chunks cover the full
- *   window; the final partial chunk rides on an earlier one's headroom, never
- *   adding an extra chunk. More chunks would mean total input > window, which
- *   the model cannot read anyway.
+ * The plugin targets the 1M-window DeepSeek models (adapter per-response cap
+ * 256K), so every number is fixed rather than window-derived:
+ * - output cap = 256K per call — half the 1M window, equal to the adapter's
+ *   hard per-response limit; reasoning tokens count toward this cap, so the
+ *   model's thinking shares it with the visible output;
+ * - per-chunk input = 50K heuristic tokens (~200K rendered chars) — small
+ *   enough that one call completes quickly and is independently retriable,
+ *   where a ~200K-token single call can take 10+ minutes or hang;
+ * - max chunks = 20 — 20 × 50K = 1M, the full window; more chunks would mean
+ *   total input > window, which the model cannot read anyway. `chunkTrimNodes`
+ *   fails loud beyond this bound ("compact the session first").
+ *
+ * The output cap is per chunk and there is NO cross-chunk aggregate cap: N
+ * chunks could theoretically emit N × 256K of output. The whole assembled
+ * checkpoint is what lands, and the shrink validation in `executeTrim`
+ * (checkpoint must be smaller than the shadowed span) bounds the real total
+ * output to the shadowed size regardless of chunk count — a model that fills
+ * every chunk's cap simply cannot pass it.
  * @param contextWindow - routed model's combined request+response capacity.
  * @param adapterMaxTokens - adapter's hard per-response output cap.
  * @returns the budget for one chunked trim.
@@ -94,8 +108,8 @@ export function resolveTrimBudget(
   }
   return {
     maxTokens: Math.min(Math.floor(contextWindow / 2), adapterMaxTokens),
-    chunkInputBudget: Math.floor(contextWindow / 5),
-    maxChunks: 10,
+    chunkInputBudget: TRIM_CHUNK_INPUT_BUDGET,
+    maxChunks: TRIM_MAX_CHUNKS,
   }
 }
 
