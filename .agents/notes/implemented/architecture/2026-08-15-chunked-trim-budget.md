@@ -44,4 +44,4 @@ Token cost is identical to parallel; parallel is faster. The only parallel risks
 
 ## Consequences
 
-A trim is now bounded: any surface the session can hold (≤ window) can be trimmed without overflowing a request or truncating a response. Large conversations split into up to 8 parallel summarization calls; the assembled checkpoint stays one replacement node, so the session lifecycle (`compaction/start`/`summary`/`end`) and surface integrity rules are unchanged. Total input beyond the window fails loud with a directive to compact first.
+A trim is now bounded: any surface the session can hold (≤ window) can be trimmed without overflowing a request or truncating a response. Large conversations split into up to 10 parallel summarization calls; the assembled checkpoint stays one replacement node, so the session lifecycle (`compaction/start`/`summary`/`end`) and surface integrity rules are unchanged. Total input beyond the window fails loud with a directive to compact first.

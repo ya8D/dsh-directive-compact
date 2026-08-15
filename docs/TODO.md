@@ -109,7 +109,7 @@ Motivation (user-verified on "插件并发测试1"): the first parallel trim fai
 - [x] `summarizeChunkWithRetry` — each chunk gets up to 3 attempts (1 initial + 2 retries) for transient failures (network hiccup, proxy switch, adapter 5xx); cancellation/abort and `DirectiveCompactionError` (expected failures) are never retried
 - [x] Unit tests (+2): transient failure retries and succeeds (2 stream calls, lifecycle complete); persistent failure gives up after 3 attempts with the lifecycle closed and surface unchanged
 - [x] README: parallel-trim retry behavior + real 403K/3-chunk verification data; DONE records the "插件并发测试1" case (1,055 nodes / 402,837 tokens → 3 chunks, output 23K with 73% reasoning, shrink passed)
-- [x] Typecheck + build green (71 unit tests: plan 16 + summarizer 13 + command 12 + trim 26 + loader-composition 3; + 3 e2e)
+- [x] Typecheck + build green (71 unit tests: plan 16 + summarizer 13 + command 12 + trim 27 + loader-composition 3; + 3 e2e)
 
 ## P10 — Deferred / optional
 

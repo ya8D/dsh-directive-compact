@@ -8,7 +8,7 @@ A fact has one home; elsewhere, link there.
 
 | Tier | Job |
 |---|---|
-| `README.md` | The package contract: install, command, behavior, Model Experience (what the model sees / token effect / KV-cache effect), Known Limitations. |
+| `README.md` | The package contract: install, command usage, behavior, Known Limitations. |
 | `.agents/notes/` | Active decision records: the why and what was given up. `implemented/` notes describe shipped reality in present tense. |
 | `src/` JSDoc | Per-module and per-function contracts. |
 | `tests/` | Behavioral pinning per `docs/testing.md` tiers (unit / REAL-composition / HMR-safety / with-key e2e). |
