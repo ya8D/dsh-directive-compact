@@ -6,7 +6,7 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { buildTrimPrompt, TRIM_INSTRUCTION, trimMarker, chunkTrimNodes, resolveTrimBudget } from '../src/trim.js'
+import { buildTrimPrompt, TRIM_INSTRUCTION, TRIM_NO_CHANGE_MARKER, trimMarker, chunkTrimNodes, resolveTrimBudget } from '../src/trim.js'
 import { createLoggerStub } from './helpers.js'
 import { executeTrim } from '../src/command-trim.js'
 import { DirectiveCompactionError } from '../src/command.js'
@@ -525,5 +525,113 @@ describe('executeTrim', () => {
     // Chunk geometry is debug-level (hidden at the default console threshold).
     const debug = stub.records.filter(r => r.level === 'debug').map(r => r.args.join(' '))
     expect(debug.some(m => m.includes('chunk %d/%d — seqs'))).toBe(true)
+  })
+
+  /** Stream chunks that reply with exactly the no-change marker. */
+  function noChangeChunks(): StreamChunk[] {
+    return [
+      { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk,
+      { type: 'text-delta', index: 0, text: TRIM_NO_CHANGE_MARKER } as StreamChunk,
+      { type: 'block-end', index: 0, block: { type: 'text', text: TRIM_NO_CHANGE_MARKER } } as StreamChunk,
+      { type: 'finish', reason: { kind: 'stop' } } as StreamChunk,
+    ]
+  }
+
+  /** Text of the landed compaction/summary checkpoint. */
+  function checkpointText(session: Session): string {
+    const summaryEvent = session.events.findLast(e => e.type === 'compaction/summary')!
+    return (summaryEvent.data as { summary: { type: string; text: string }[] }).summary
+      .map(b => b.text)
+      .join('\n')
+  }
+
+  it('reports nothing to trim when the only chunk declares no change', async () => {
+    const s = sessionWithTurns(5)
+    const surfaceBefore = [...s.surface.nodes]
+    // Content-keyed meter: the framed checkpoint (marker + guard + verbatim
+    // original rendering) is larger than the shadowed span, so the trim is a
+    // whole-surface no-change and reports it (not an error).
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          for (const chunk of noChangeChunks()) yield chunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith((message: { content: { type: string; text: string }[] }) => {
+        const text = message.content.map(b => b.text).join('')
+        return text.includes('[Directive trim, per requirement') ? 1000 : 10
+      }),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'delete nothing here'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    // Whole-surface no-change: the verbatim checkpoint is not smaller than the
+    // shadowed span, so the P10.3 no-change path reports it (not an error).
+    expect(result.text).toContain('Nothing to trim')
+    expect(s.surface.nodes).toEqual(surfaceBefore)
+    expect(checkpointText(s)).not.toContain(TRIM_NO_CHANGE_MARKER)
+  })
+
+  it('keeps a no-change chunk verbatim and assembles changed chunks from the model', async () => {
+    const s = sessionWithTurns(5)
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          if (streamCalls === 1) {
+            for (const chunk of noChangeChunks()) yield chunk
+          } else {
+            for (const chunk of TRIM_CHUNKS) yield chunk
+          }
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: {
+        estimateMessage: () => 10,
+        measure: (sess: Session) => {
+          const nodes = sess.surface.nodes.map(seq => ({ seq, tokens: 15_000 }))
+          return { nodes, totalTokens: nodes.length * 15_000, surfaceTokens: nodes.length * 15_000 }
+        },
+      },
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    // 13 nodes × 15K = 195K > 50K → 5 chunks; chunk 1 declares no change.
+    expect(streamCalls).toBe(5)
+    const text = checkpointText(s)
+    // Chunk 1's original rendering survives verbatim (the role-prefixed span).
+    expect(text).toContain('[part 1/5]')
+    expect(text).toContain('[user] first task')
+    expect(text).toContain('[assistant] first answer')
+    // The changed chunks contribute the model's output.
+    expect(text).toContain('[part 2/5]')
+    expect(text).toContain('trimmed context')
+    // The marker itself never lands in the checkpoint.
+    expect(text).not.toContain(TRIM_NO_CHANGE_MARKER)
+  })
+
+  it('treats a marker embedded in other content as changed (no marker abuse)', async () => {
+    const s = sessionWithTurns(5)
+    const mixedChunks = [
+      { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk,
+      { type: 'text-delta', index: 0, text: `keep this ${TRIM_NO_CHANGE_MARKER} inline` } as StreamChunk,
+      { type: 'block-end', index: 0, block: { type: 'text', text: `keep this ${TRIM_NO_CHANGE_MARKER} inline` } } as StreamChunk,
+      { type: 'finish', reason: { kind: 'stop' } } as StreamChunk,
+    ]
+    const ctx = fakeCtx(mixedChunks)
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    // Not a pure marker reply → assembled as normal content.
+    expect(checkpointText(s)).toContain(`keep this ${TRIM_NO_CHANGE_MARKER} inline`)
   })
 })

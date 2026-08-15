@@ -6,6 +6,7 @@ All notable changes to `@ya8d/dsh-directive-compact` are documented here. The fo
 
 ### Added
 
+- Trim no-change declaration (speed): the trim prompt asks the model to first judge whether the requirement changes its chunk at all; if nothing does, the model replies with exactly `<<NO_CHANGE>>` and the command layer keeps that chunk's **original rendering verbatim** in the checkpoint instead of paying the model to regenerate it. Only chunks with real changes spend time in the model — a large-surface trim whose requirement matches little (e.g. "delete telemetry" in a session with almost none) now costs only the changed chunks, not a full ~350K-token rewrite. A marker buried in other output is treated as content, never as a declaration, so the marker cannot be abused to silently drop content.
 - Phase logging for both commands through the Cordis logger service under the `dsh-directive-compact` scope (matching the upstream `compaction-basic` convention): `info` milestones with timings (begin / per-chunk done / all-chunks done / committed, each with elapsed ms and token counts), `warn` on failures and per-chunk retries, and `debug` for call time-to-first-chunk / stream duration and chunk geometry. README documents what each line means and how to enable debug.
 
 ### Changed
