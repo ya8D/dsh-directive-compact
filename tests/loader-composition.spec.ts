@@ -54,7 +54,7 @@ async function loadYaml(lines: readonly string[]): Promise<Context> {
 }
 
 describe('real Loader composition', () => {
-  it('loads the plugin and registers /compact-directive as a global command', async () => {
+  it('loads the plugin and registers both commands as global commands', async () => {
     const loaded = await loadYaml([
       "- name: '@deepseek-ai/dsh-llm'",
       "- name: '@deepseek-ai/dsh-session'",
@@ -65,10 +65,11 @@ describe('real Loader composition', () => {
     // CommandRuntime exposes the registry; a global command is visible to any agent.
     const registry = loaded.commands
     expect(registry).toBeDefined()
-    // The plugin's command is registered (name present in the directory for a
+    // The plugin's commands are registered (name present in the directory for a
     // minimal agent view; global definitions are plain-context registrations).
     const listed = registry.list(undefined as never)
     expect(listed.some(c => c.name === 'compact-directive')).toBe(true)
+    expect(listed.some(c => c.name === 'trim-directive')).toBe(true)
   })
 
   it('exposes named exports only — no default export (Loader drops it otherwise)', async () => {
@@ -79,7 +80,7 @@ describe('real Loader composition', () => {
     expect(typeof mod.apply).toBe('function')
   })
 
-  it('HMR-safety: disposing the fiber unregisters /compact-directive', async () => {
+  it('HMR-safety: disposing the fiber unregisters both commands', async () => {
     const loaded = await loadYaml([
       "- name: '@deepseek-ai/dsh-llm'",
       "- name: '@deepseek-ai/dsh-session'",
@@ -88,9 +89,12 @@ describe('real Loader composition', () => {
       "- name: '@ya8d/dsh-directive-compact'",
     ])
     const registry = loaded.commands
-    expect(registry.list(undefined as never).some(c => c.name === 'compact-directive')).toBe(true)
+    const names = (): string[] => registry.list(undefined as never).map(c => c.name)
+    expect(names()).toContain('compact-directive')
+    expect(names()).toContain('trim-directive')
     await loaded.fiber.dispose()
-    expect(registry.list(undefined as never).some(c => c.name === 'compact-directive')).toBe(false)
+    expect(names()).not.toContain('compact-directive')
+    expect(names()).not.toContain('trim-directive')
     context = undefined // already disposed; skip afterEach double-dispose
   })
 })

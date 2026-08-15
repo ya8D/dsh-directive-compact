@@ -167,6 +167,12 @@ function summarizationError(finish: FinishReason): Error | undefined {
  *   plain four-point summary.
  * @param sessionId - the owning session, stamped for request routing.
  * @param signal - optional cancellation forwarded to the adapter.
+ * @param promptBuilder - overrides the prompt prefix for the span; defaults to
+ *   `buildSummaryPrompt`. The trim command passes `buildTrimPrompt` so the
+ *   requirement is the sole instruction with no four-point baseline.
+ * @param markerBuilder - overrides the directive marker prepended to the
+ *   summary; defaults to `checkpointMarker`. The trim command passes
+ *   `trimMarker` so the landed checkpoint identifies itself as a trim.
  * @returns the safe text summary and the exact call envelope.
  */
 export async function summarizeWithDirective(
@@ -176,15 +182,17 @@ export async function summarizeWithDirective(
   directive: string | undefined,
   sessionId: SessionId,
   signal?: AbortSignal,
+  promptBuilder: (directive: string | undefined) => string = buildSummaryPrompt,
+  markerBuilder: (directive: string) => string = checkpointMarker,
 ): Promise<DirectiveSummaryResult> {
   const rendered = renderSpan(messages)
   if (rendered.length > MAX_RENDERED_INPUT_CHARS) {
     throw new Error(
       `directive summarization input too large (${rendered.length} rendered chars > ${MAX_RENDERED_INPUT_CHARS}); `
-      + 'the middle span must be reduced before summarizing',
+      + 'the span must be reduced before summarizing',
     )
   }
-  const prompt = `${buildSummaryPrompt(directive)}${rendered}`
+  const prompt = `${promptBuilder(directive)}${rendered}`
   const message = createUserMessage({
     content: [{ type: 'text', text: prompt }],
     source: { kind: 'plugin', plugin: 'dsh-directive-compact' },
@@ -212,7 +220,7 @@ export async function summarizeWithDirective(
     throw new Error('directive summarization produced no text summary content')
   }
   const summary: ContentBlock[] = [
-    ...(directive === undefined ? [] : [{ type: 'text' as const, text: checkpointMarker(directive) }]),
+    ...(directive === undefined ? [] : [{ type: 'text' as const, text: markerBuilder(directive) }]),
     { type: 'text', text: CHECKPOINT_GUARD },
     ...textBlocks,
   ]
