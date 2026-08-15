@@ -25,9 +25,9 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 
 ## P2 — Summarization
 
-- [ ] `src/summarizer.ts` — four-point baseline prompt (task goal / done steps / findings / next step + verbatim `[user]` utterances), directive-layered prompt, directive-only degraded prompt, clean single-message call
-- [ ] Unit tests: prompt construction (with/without directive), no-text rejection, image rejection, finish-error mapping
-- [ ] Typecheck + build green
+- [x] `src/summarizer.ts` — `FOUR_POINT_INSTRUCTION` (task goal / done steps / findings / next step + verbatim `[user]` utterances, ContextForge `_SUMMARY_PROMPT`; the `[user]` marker is a named contract shared with `renderSpan`), `buildSummaryPrompt` (directive layered over the four-point baseline), `renderSpan` (role-prefixed plain text), `summarizeWithDirective` (clean single-message call: BlockAssembler, image rejection, no-text rejection, finish-error mapping, oversized-input guard), `checkpointMarker` / `CHECKPOINT_GUARD`. The ContextForge `_build_directive_only_prompt` port (`directiveInstruction`) was dropped — P1 established the single-path design, so it had no caller.
+- [x] Unit tests: prompt construction (with/without directive), renderSpan (text/tool blocks), summary marker/guard, image rejection, no-text rejection, finish-error mapping (max-tokens / error), oversized-input guard
+- [x] Typecheck + build green (32 tests total: 19 plan + 13 summarizer)
 
 ## P3 — Command transaction
 
