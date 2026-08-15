@@ -193,4 +193,40 @@ describe('executeDirectiveCompact', () => {
     )
     expect(result.kind).toBe('success')
   })
+
+  it('regression: a cancelled summarization leaves the surface intact', async () => {
+    const s = sessionWithTurns(8)
+    const surfaceBefore = [...s.surface.nodes]
+    // A stream that throws a cancellation error.
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          throw new Error('This operation was aborted')
+        },
+      },
+      tokenMeter: { estimateMessage: () => 10 },
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    await expect(executeDirectiveCompact(ctx as never, invocationFor(agentFor(s), 'keep x'), CONFIG))
+      .rejects.toThrow()
+    // Lifecycle closed with an error, but no surface replacement was made.
+    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
+    expect(s.surface.nodes).toEqual(surfaceBefore)
+  })
+
+  it('regression: a failed compaction never leaves a partial replace', async () => {
+    const s = sessionWithTurns(8)
+    const surfaceBefore = [...s.surface.nodes]
+    const ctx = fakeCtx([
+      { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'E' } } } as StreamChunk,
+    ])
+    await expect(executeDirectiveCompact(ctx as never, invocationFor(agentFor(s), 'keep x'), CONFIG))
+      .rejects.toThrow(DirectiveCompactionError)
+    // No user/message replace was appended; the surface is unchanged.
+    expect(s.surface.nodes).toEqual(surfaceBefore)
+    // From the compaction/start marker on, only the lifecycle events exist —
+    // no user/message replacement landed.
+    const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
+    const after = s.events.slice(startIdx)
+    expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
+  })
 })
