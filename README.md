@@ -2,10 +2,14 @@
 
 A customized natural-language compaction plugin. It gives you the ability to precisely trim context — sometimes even to fix a malfunctioning context.
 
+**Designed for large-context models (1,000,000-token window, e.g. deepseek-v4-flash).** The chunking budget is derived from the routed model's window (see [How it works](#how-it-works)); the numbers below assume the 1M window.
+
 It registers two global commands for DeepSeek Harness:
 
 - `/compact-directive <requirement>` — keeps the session's fixed skeleton head (the first user message plus the injected `agent-instructions` / `system-prompt` / `skill-catalog` nodes) and the recent turns verbatim, and summarizes only the middle span according to your natural-language requirement — so an aggressive directive like "delete everything about doc" trims what you asked for without erasing the task anchor the model needs to keep working.
-- `/trim-directive <pattern>` — deletes every surface node whose rendered text matches the pattern, with **zero region protection**. This is the escape hatch when the directive must reach protected content: "delete all context about X" works even when X lives in the head, because trim has no head.
+- `/trim-directive <requirement>` — hands the whole conversation to the model and trims it per your natural-language requirement, with **zero dialogue-region protection**. This is the escape hatch when the directive must reach protected content: "delete all context about X" works even when X lives in the head, because trim has no head.
+
+> **⚠️ Recommended: use in a forked session.** A trim permanently removes the trimmed content from the model-visible surface: no undo in the UI, no minimum retention. The original text is NOT lost — the session log is append-only, so every trimmed node survives in `session.events` and the replace event records its exact seqs (`shadowedSeqs`/`sourceEventSeqs`) — but recovering it requires tooling; the conversation UI offers no restore. For destructive experiments, fork the session first.
 
 ## Install
 
@@ -51,6 +55,14 @@ The head is the session's fixed skeleton, not merely the first message: every De
 
 The trim renders the trim-able dialogue (everything after the injected system nodes) and sends it to the model with a directive-only prompt. The model's output replaces the whole trim range as one checkpoint through the standard summarizing lifecycle — `compaction/start` (standalone) → `compaction/summary` → `user/message` replace → `compaction/end`. A shrink check rejects a checkpoint that is not smaller than the span it replaces, and the range boundaries are tool-pairing balanced so a tool-call/result pair is never split.
 
+Every summarization call is bounded to the routed model's context window. For the 1,000,000-token window (deepseek-v4-flash):
+
+- **Output cap** `maxTokens` = `min(window/2, adapter max output)` = `min(500K, 256K)` = **256K**. Reasoning tokens count toward this cap, so the model's thinking shares it with the visible trimmed output — at most ~56K of thinking leaves ≥200K for the output.
+- **Per-chunk input budget** = `window/5` = **200K**, so a chunk's input + output (≤256K) stays far inside the window with headroom for estimation error and request overhead.
+- **Max chunks** = **10** — the worst-case fragmentation bound over the 1M window: a single very large node (e.g. ~101K, over half the chunk budget) can fill a chunk alone, so 10 chunks cover the full window; the final partial chunk rides on an earlier chunk's headroom rather than adding an extra chunk.
+
+When the trim-able dialogue exceeds one chunk, it is sliced into budget-sized chunks (cut at tool-pairing-balanced boundaries) that are summarized **in parallel** and assembled into one checkpoint under `[part N/M]` dividers. Total input beyond the window (1M) fails loud with a directive to compact first.
+
 Because the injected nodes sit between the first user message and the rest of the conversation, the trim range starts after them — the opening anchor (first user message) stays outside the range as a structural consequence of that contiguous replacement, not as a protection policy. Everything after the skeleton is trim-able.
 
 Both middle-span replacement and trim are performed through `session.append` with `surfaceOp: { op: 'replace' }`, so the session's own append validation (surface provenance, source-event coverage, tool-result rewrite rules) still enforces integrity at the write boundary.
@@ -69,6 +81,8 @@ A trim sends the trim-able dialogue to the model with a directive-only prompt; t
 
 The directive adds its own tokens to the auxiliary summarization request and to the checkpoint that lands in the conversation. The session head (AGENTS.md + system prompt + skill catalog) is large and preserved verbatim, so compact-directive savings are bounded to the middle span — the same trade the reference design makes. Trim spends one summarization call and unconditionally reduces the trim-able surface.
 
+**Thinking is not disabled, so a custom trim can take tens of seconds to minutes.** The trim call keeps the model's reasoning (deliberately: `reasoningEffort: 'off'` would disable thinking entirely and hurt the cut decisions). On a real run, deepseek-v4-flash spent 34,244 of its 36,874 output tokens on reasoning (~93%) before writing a ~2,630-token trimmed context — the whole operation took ~4.5 minutes for a 28-node, ~9,876-token span. Expect complex natural-language requirements to reason heavily first.
+
 ### KV Cache effect
 
 A positional replacement invalidates reuse from the first replaced history token onward, exactly as the upstream compaction backend does. The unchanged head before that range remains reusable.
@@ -77,9 +91,11 @@ A positional replacement invalidates reuse from the first replaced history token
 
 - **Middle-span savings only (compact-directive).** The fixed head and recent turns are preserved by design, so a session with very little middle content saves little; the tail floor guarantees the last user utterance and its in-flight flow survive regardless. The directive cannot delete protected content — use `/trim-directive` for that.
 - **Shrink validation can reject small spans (compact-directive).** A checkpoint must be smaller than the span it replaces; a verbose model summary over a small middle span can exceed it, so the compaction is rejected (recorded in the log, conversation unchanged). This mirrors the upstream convergence check and mainly affects tiny middles — real long sessions compress comfortably.
-- **Zero protection is the point (trim-directive), and the risk.** A broad or accidental requirement can delete content the user still needs, down to a session holding only the injected skeleton and the checkpoint. There is no undo and no minimum dialogue retention; check the requirement before running it.
+- **Zero protection is the point (trim-directive), and the risk.** A broad or accidental requirement can delete content the user still needs, down to a session holding only the injected skeleton and the checkpoint. There is no UI undo and no minimum dialogue retention; check the requirement before running it. The trimmed content is NOT erased from the append-only session log (every shadowed node's text survives and the replace records its seqs), but restoring it needs tooling — **fork the session before destructive trims**.
 - **Model judgment (trim-directive).** The model decides what survives from the rendered dialogue. It generally follows the requirement, but an ambiguous or self-contradictory requirement may yield an unexpected trim; there is no deterministic per-node guarantee.
+- **Tuned for 1M-window models.** The chunking budget (`window/5` input, `min(window/2, 256K)` output, 10 chunks max) is derived from a 1,000,000-token window. On a smaller-window model the absolute numbers shrink proportionally (the budget is always `window/5` etc.), but the adapter output cap of 256K assumes deepseek's limits.
+- **Chunking is heuristic-priced (trim-directive).** Chunk boundaries are chosen by the token-meter's per-node heuristic estimates; a misestimate can make a chunk larger than budgeted, though the hard window check still guards the request. Chunking also means a large trim runs several parallel model calls (token cost = the sum of their inputs+outputs, identical to one serial pass).
 - **System nodes always preserved.** The injected `agent-instructions` / `system-prompt` / `skill-catalog` nodes are session machinery, never trim-able; the trim range starts after them, so the opening anchor (first user message) stays outside the range too.
 - **No before/after rendering.** The transactions record the standard lifecycle (`compaction/start` / `compaction/summary` / `compaction/end`) in the session log; there is no dedicated before/after comparison event, and the conversation UI does not render the directive or its context. A log-visible `compaction/directive-before-after` comparison is deferred.
 - **Clean-call summarization (compact-directive).** The summarization request is one focused user message with no system prompt or conversation prefix, so it does not reuse a warm-prefix KV cache. That is the deliberate trade of cache reuse for a more focused summary.
-- **Implementation status.** The command, planning, and summarization implementation (P1–P7) is merged, including the AI-driven free-trim command (P6) and the compact-directive polish (P7: required directive, shrink validation). The package is not yet published to the npm registry, so installs must come from a local checkout or tarball.
+- **Implementation status.** The command, planning, and summarization implementation (P1–P8) is merged, including the AI-driven free-trim command (P6), the compact-directive polish (P7: required directive, shrink validation), and the budgeted chunked trim (P8). The package is not yet published to the npm registry, so installs must come from a local checkout or tarball.

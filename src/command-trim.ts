@@ -20,12 +20,13 @@ import type {} from '@deepseek-ai/dsh-compaction/types'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
 // Type-only: activates the `ctx.tokenMeter` declaration on the Cordis context.
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { summarizeWithDirective } from './summarizer.js'
-import { buildTrimPrompt, trimMarker } from './trim.js'
+import { CHECKPOINT_GUARD } from './summarizer.js'
+import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, type PricedTrimNode } from './trim.js'
 import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget, surfaceNodes } from './command.js'
 
 /**
@@ -134,23 +135,29 @@ export async function executeTrim(
   const end = surface[endIdx]!
   const shadowedSeqs = surface.slice(startIdx, endIdx + 1)
 
-  // Render only the trim-able dialogue for the model; injected system nodes
-  // stay out of both the prompt and the replaced range.
-  const messages: Message[] = shadowedSeqs.flatMap((seq) => {
-    const event = session.events[seq]
-    return event === undefined ? [] : (session.deriveEventMessage(event) === null ? [] : [session.deriveEventMessage(event)!])
-  })
-  if (messages.length === 0) {
-    return { kind: 'success', text: 'No conversational content to trim.' }
-  }
-
   const target = resolveDirectiveTarget(invocation.agent, {
     keepHeadUsers: 0,
     keepTailUsers: 0,
     summarizationProvider: '',
     summarizationModel: '',
-    maxTokens: 8192,
+    maxTokens: 8192, // placeholder; replaced by the window-derived budget below
   })
+  // Budget the summarization against the routed model's real window so no
+  // single call (and no chunk) can overflow the context: maxTokens =
+  // min(window/2, adapter max output), per-chunk input = window/5.
+  const modelInfo = await ctx.llm.resolveModelInfo(target.provider, target.model, invocation.signal)
+  if (modelInfo.context?.contextWindow === undefined) {
+    // A silent 1M fallback would over-budget a smaller-window model (chunks
+    // sized for 1M could overflow a 32K window); fail loud instead.
+    throw new DirectiveCompactionError(
+      'summary',
+      `directive trim: model ${target.provider}/${target.model} reports no context window; cannot budget the trim`,
+    )
+  }
+  const budget = resolveTrimBudget(
+    modelInfo.context.contextWindow,
+    256_000, // adapter hard per-response cap (llm-deepseek DEFAULT_MAX_TOKENS)
+  )
 
   const compactionId = CompactionId(crypto.randomUUID())
   const lifecycle = {
@@ -164,28 +171,70 @@ export async function executeTrim(
   let committing = false
 
   try {
-    const summary = await summarizeWithDirective(
-      ctx,
-      target,
-      messages,
-      directive,
-      session.id,
-      invocation.signal,
-      buildTrimPrompt,
-      trimMarker,
-    )
+    // Price every shadowed node ONCE via the token meter, then slice into
+    // budget-sized chunks with balanced cut points.
+    const measurement = ctx.tokenMeter.measure(session)
+    const priced: PricedTrimNode[] = shadowedSeqs.flatMap((seq) => {
+      const node = measurement.nodes.find(n => n.seq === seq)
+      return node === undefined ? [] : [{ seq, tokens: node.tokens }]
+    })
+    const chunks = chunkTrimNodes(priced, budget, node => toolPairingBalancedBefore(session, node.seq))
+    if (chunks.length === 0) {
+      return { kind: 'success', text: 'No conversational content to trim.' }
+    }
+
+    // Summarize every chunk in parallel. Each chunk is a full trim call over
+    // its own rendered span; HTTP 429 rate limits are retried by the adapter's
+    // retryPolicy. All chunks share the same directive and marker.
+    const chunkResults = await Promise.all(chunks.map(async (chunk, index) => {
+      const chunkMessages: Message[] = chunk.seqs.flatMap((seq) => {
+        const event = session.events[seq]
+        return event === undefined ? [] : (session.deriveEventMessage(event) === null ? [] : [session.deriveEventMessage(event)!])
+      })
+      const result = await summarizeWithDirective(
+        ctx,
+        { ...target, maxTokens: budget.maxTokens },
+        chunkMessages,
+        directive,
+        session.id,
+        invocation.signal,
+        buildTrimPrompt,
+        trimMarker,
+      )
+      return { result, index }
+    }))
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
     }
-    const shadowedTokenCount = shadowedSeqs.reduce((total, seq) => {
-      const event = session.events[seq]
-      const message = event === undefined ? null : session.deriveEventMessage(event)
-      return total + (message === null ? 0 : ctx.tokenMeter.estimateMessage(message))
-    }, 0)
+
+    // Assemble one checkpoint: marker + guard once, then each chunk's text
+    // blocks under a [part N/M] divider.
+    const partCount = chunkResults.length
+    const assembled: ContentBlock[] = [
+      { type: 'text', text: trimMarker(directive) },
+      { type: 'text', text: CHECKPOINT_GUARD },
+    ]
+    const rawOutput: ContentBlock[] = []
+    let usage: TokenUsage | undefined
+    for (const { result, index } of chunkResults) {
+      if (partCount > 1) {
+        assembled.push({ type: 'text', text: `[part ${index + 1}/${partCount}]` })
+      }
+      for (const block of result.summary) {
+        // Skip the per-chunk marker/guard repeats; the single head covers them.
+        if (block.type === 'text'
+          && (block.text === trimMarker(directive) || block.text === CHECKPOINT_GUARD)) continue
+        assembled.push(block)
+      }
+      rawOutput.push(...result.rawOutput ?? [])
+      usage = mergeUsage(usage, result.usage)
+    }
+
+    const shadowedTokenCount = priced.reduce((total, node) => total + node.tokens, 0)
     // Shrink validation: the framed checkpoint must be smaller than the
     // shadowed span (mirror of the upstream convergence check).
     const checkpoint = createUserMessage({
-      content: summary.summary,
+      content: assembled,
       source: compactCheckpointSource(compactionId, invocation.commandId),
     })
     const framedTokenCount = ctx.tokenMeter.estimateMessage(checkpoint)
@@ -198,15 +247,15 @@ export async function executeTrim(
     const summaryEvent = session.append('compaction/summary', {
       compactionId,
       sourceCommandId: invocation.commandId,
-      summary: summary.summary,
+      summary: assembled,
       shadowedRange: { start, end },
       shadowedSeqs: [...shadowedSeqs],
       shadowedTokenCount,
-      provider: summary.provider,
-      model: summary.model,
-      ...summary.maxTokens === undefined ? {} : { maxTokens: summary.maxTokens },
-      ...summary.usage === undefined ? {} : { usage: summary.usage },
-      rawOutput: summary.rawOutput as ContentBlock[],
+      provider: target.provider,
+      model: target.model,
+      maxTokens: budget.maxTokens,
+      ...usage === undefined ? {} : { usage },
+      rawOutput,
       llmStreamCall: true,
     })
     committing = true
@@ -217,7 +266,7 @@ export async function executeTrim(
     session.append('compaction/end', lifecycle)
     return {
       kind: 'success',
-      text: `Trimmed ${shadowedSeqs.length} history items (~${shadowedTokenCount} tokens) per the requirement.`,
+      text: `Trimmed ${shadowedSeqs.length} history items (~${shadowedTokenCount} tokens, ${partCount} chunk${partCount === 1 ? '' : 's'}) per the requirement.`,
       sourceEventSeq: summaryEvent.seq,
     }
   } catch (error: unknown) {
@@ -228,5 +277,27 @@ export async function executeTrim(
       throw new DirectiveCompactionError('commit', String(error))
     }
     throw new DirectiveCompactionError('summary', String(error))
+  }
+}
+
+/** Sum disjoint provider usage buckets across chunk calls. */
+function mergeUsage(
+  left: TokenUsage | undefined,
+  right: TokenUsage | undefined,
+): TokenUsage | undefined {
+  if (left === undefined) return right
+  if (right === undefined) return left
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    ...left.cacheReadTokens === undefined && right.cacheReadTokens === undefined
+      ? {}
+      : { cacheReadTokens: (left.cacheReadTokens ?? 0) + (right.cacheReadTokens ?? 0) },
+    ...left.cacheWriteTokens === undefined && right.cacheWriteTokens === undefined
+      ? {}
+      : { cacheWriteTokens: (left.cacheWriteTokens ?? 0) + (right.cacheWriteTokens ?? 0) },
+    ...left.reasoningTokens === undefined && right.reasoningTokens === undefined
+      ? {}
+      : { reasoningTokens: (left.reasoningTokens ?? 0) + (right.reasoningTokens ?? 0) },
   }
 }

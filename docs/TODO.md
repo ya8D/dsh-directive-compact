@@ -82,8 +82,28 @@ Design (from source analysis + user confirmation):
 - [x] Confirm the middle-compaction differentiation stays (directive layering + head/tail protection are the value; upstream wins on KV cache and 8-section structure, so the no-directive path must not compete)
 - [x] With-key e2e: real-model run may legitimately hit the shrink rejection (a verbose model summary can exceed a small span) — the e2e asserts both correct outcomes (success + lifecycle, or shrink rejection + lifecycle closed + surface unchanged); unit tests cover the deterministic shrink-rejection and empty-directive cases
 
-## Deferred / optional
+## P8 — `/trim-directive` budgeted chunked compression (v2 design)
+
+User-confirmed v2 design for large conversations: bound every summarization call inside the model's context window instead of failing on a too-large render or a truncated summary.
+
+- **Window W**: `ctx.llm.resolveModelInfo(...).context.contextWindow` — MAXIMUM COMBINED request + response tokens (dsh `LlmModelContext.contextWindow` JSDoc). deepseek-v4-flash: 1,000,000 (decimal, DeepSeek's spec — not 2²⁰).
+- **Output budget maxTokens** = `min(W/2, adapter DEFAULT_MAX_TOKENS)` = `min(500K, 256K)` = 256K. Reasoning tokens COUNT toward the output budget (`completion_tokens_details.reasoning_tokens`), so thinking eats into the 256K — the model's own trade, not a configured split; at most ~56K of thinking leaves ≥200K of output, matching the chunk input.
+- **Per-chunk input budget** = `W/5` = 200K. Single chunk occupies 200K in + ≤256K out = ≤456K < W (544K headroom for token-meter estimation error + request overhead).
+- **Chunk count** = `ceil(totalInput / 200K)`, capped at 10; total input > chunks × budget → fail loud ("compact the session first"). 10 = worst-case fragmentation bound over the real 1M window (single ~101K node per chunk → `ceil(1M / 101K) = 10`); the final partial chunk rides on an earlier chunk's headroom, never adding an extra chunk.
+- **Chunk unit**: `ctx.tokenMeter.measure(session).nodes[].tokens` (same source as upstream `selectCompactableRange`); cut points expand to `toolPairingBalancedBefore` so a tool-call/result pair is never split.
+- **Execution**: chunks summarized in parallel (no artificial concurrency cap; HTTP 429 handled by the adapter's retryPolicy).
+- **Assembly**: one `user/message` replace over the whole trim range; marker + guard once; each chunk's output appended as its own text block with `[part N/M]`.
+
+- [x] Verify feasibility against dsh source (token-meter measure, resolveModelInfo, adapter max-tokens, parallel stream, multi-block replace) and record in the Agent Note
+- [x] `src/trim.ts` — budget math (`resolveTrimBudget`, `chunkTrimNodes` with balanced cut points)
+- [x] `src/command-trim.ts` — parallel chunked summarization + `[part N/M]` assembly into one replace
+- [x] Unit tests: budget math, chunk boundary balancing, parallel dispatch, part assembly, fail-loud on total input > window
+- [x] With-key e2e for `/trim-directive` (real DeepSeek call, self-skips without a key)
+- [x] README: chunking behavior, Model Experience, Known Limitations
+- [x] Typecheck + build green
+
+## P9 — Deferred / optional
 
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek
-- [ ] With-key e2e for `/trim-directive` (real DeepSeek call, self-skips without a key)
+- [ ] BUG (user-verified, GUI): during `/trim-directive` "executing…", the dialogue stays visible with no progress feedback. The replacement DOES land when the trim finishes (verified) — the issue is UX only: the async LLM window (potentially many seconds, more with chunking) shows nothing changing. Options: a progress indicator (e.g. "compressing chunk 2/5…"), or a status line in the command result. Requires an upstream UI hook; the plugin can already surface progress via the command result text.
