@@ -120,7 +120,7 @@ function messageFor(session: Session, seq: number): Message | null {
  * @param session - session whose log is inspected.
  * @returns the open turn number, or `null` when between turns.
  */
-function openTurnNumber(session: Session): number | null {
+export function openTurnNumber(session: Session): number | null {
   const events = session.events
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!

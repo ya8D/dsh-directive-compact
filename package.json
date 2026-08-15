@@ -1,6 +1,6 @@
 {
   "name": "@ya8d/dsh-directive-compact",
-  "description": "Pure-incremental directive-driven compaction for DeepSeek Harness: /compact-directive <requirement> keeps the session's fixed head and recent turns while summarizing the middle per your natural-language requirement",
+  "description": "Pure-incremental directive-driven compaction for DeepSeek Harness: /compact-directive <requirement> summarizes the session middle per your requirement, /trim-directive <pattern> deletes matching surface content with zero protection",
   "version": "0.1.0",
   "license": "MIT",
   "publishConfig": {
@@ -42,6 +42,10 @@
     "lib/summarizer.d.ts",
     "lib/command.js",
     "lib/command.d.ts",
+    "lib/command-trim.js",
+    "lib/command-trim.d.ts",
+    "lib/trim.js",
+    "lib/trim.d.ts",
     "lib/invariant.js",
     "lib/invariant.d.ts",
     "cordis.patch.yml"
