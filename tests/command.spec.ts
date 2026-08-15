@@ -229,4 +229,40 @@ describe('executeDirectiveCompact', () => {
     const after = s.events.slice(startIdx)
     expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
   })
+
+  it('P7: rejects an empty directive and points at /compact', async () => {
+    const s = sessionWithTurns(8)
+    const before = s.events.length
+    const result = await executeDirectiveCompact(fakeCtx(SUMMARY_CHUNKS) as never, invocationFor(agentFor(s), '   '), CONFIG)
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') return
+    expect(result.text).toContain('/compact-directive <requirement>')
+    expect(result.text).toContain('/compact')
+    // No lifecycle was opened: the refusal happens before compaction/start.
+    expect(s.events.length).toBe(before)
+  })
+
+  it('P7: rejects a checkpoint that does not shrink the shadowed span', async () => {
+    const s = sessionWithTurns(8)
+    const userMessagesBefore = s.events.filter(e => e.type === 'user/message').length
+    const ctx = fakeCtx(SUMMARY_CHUNKS)
+    // Distinguish the framed checkpoint from the shadowed nodes by content:
+    // the checkpoint carries the directive marker + guard, the shadowed
+    // conversation messages do not. This survives estimateMessage call-count
+    // changes, unlike a positional "first N calls are shadowed" threshold.
+    const inflated = {
+      llm: ctx.llm,
+      tokenMeter: {
+        estimateMessage: (message: { content: { type: string; text: string }[] }) => {
+          const text = message.content.map(b => b.text).join('')
+          return text.includes('[Directive-driven compaction checkpoint') ? 1000 : 10
+        },
+      },
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
+    await expect(executeDirectiveCompact(inflated as never, invocationFor(agentFor(s), 'keep x'), CONFIG))
+      .rejects.toThrow(DirectiveCompactionError)
+    // The lifecycle is still closed with the error, and no replace landed.
+    expect(s.events[s.events.length - 1]!.type).toBe('compaction/end')
+    expect(s.events.filter(e => e.type === 'user/message').length).toBe(userMessagesBefore)
+  })
 })

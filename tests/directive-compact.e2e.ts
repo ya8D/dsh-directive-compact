@@ -11,7 +11,7 @@ import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-import { executeDirectiveCompact } from '../src/command.js'
+import { DirectiveCompactionError, executeDirectiveCompact } from '../src/command.js'
 import type { CommandConfig } from '../src/command.js'
 
 /**
@@ -45,7 +45,7 @@ const CONFIG: CommandConfig = {
   keepTailUsers: 3,
   summarizationProvider: '',
   summarizationModel: '',
-  maxTokens: 2048,
+  maxTokens: 8192,
 }
 
 const contexts: Context[] = []
@@ -73,6 +73,12 @@ function appendTurn(session: Session, turn: number, userText: string, assistantT
   session.append('turn/end', { turn, reason: { kind: 'completed' } })
 }
 
+/** A long user turn so the shadowed middle is far larger than the checkpoint. */
+function appendSubstantialTurn(session: Session, turn: number, topic: string): void {
+  const detail = Array.from({ length: 40 }, (_, i) => `${topic} detail ${i}: a fact worth remembering for later work`).join('\n')
+  appendTurn(session, turn, detail, `answer with ${topic} summary`)
+}
+
 /** Build a session with the fixed skeleton head plus N user turns. */
 function sessionWithTurns(n: number): Session {
   const s = Session.create(SessionId('directive-e2e'))
@@ -87,7 +93,14 @@ function sessionWithTurns(n: number): Session {
     content: [{ type: 'text', text: 'skills' }], source: { kind: 'plugin', plugin: 'skill-catalog' },
   }), { surfaceOp: 'append' })
   for (let i = 2; i <= n; i += 1) {
-    appendTurn(s, i, `task ${i}`, `answer ${i}`)
+    // Turns 4-6 carry substantial content so the shadowed middle is far
+    // larger than the framed checkpoint (marker + guard + summary), keeping
+    // the real-model shrink validation meaningful.
+    if (i >= 4 && i <= 6) {
+      appendSubstantialTurn(s, i, `login flow step ${i}`)
+    } else {
+      appendTurn(s, i, `task ${i}`, `answer ${i}`)
+    }
   }
   return s
 }
@@ -125,19 +138,42 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
 
     const s = sessionWithTurns(8)
     const surfaceBefore = s.surface.nodes.length
-    const result = await executeDirectiveCompact(
-      ctx,
-      invocationFor(agentFor(s), 'keep the login details, drop the rest'),
-      CONFIG,
-    )
-    expect(result.kind).toBe('success')
-    if (result.kind !== 'success') return
-    expect(result.text).toContain('per the directive')
+    // Real-model behavior is not deterministic: a compaction either shrinks the
+    // span (success + full lifecycle + checkpoint) or the model's summary is
+    // larger than the span and the shrink validation rejects it (summary error
+    // + lifecycle closed + surface unchanged). Both are correct outcomes.
+    //
+    // The shrink-rejected branch is not guaranteed to run on every pass — which
+    // branch executes depends on the model's verbosity on the day. The
+    // DETERMINISTIC shrink-rejection coverage lives in the unit suite
+    // (command.spec.ts, via a content-keyed fake meter); this e2e keeps both
+    // assertions because validating real behavior on either path still matters.
+    let outcome: 'success' | 'shrink-rejected'
+    try {
+      const result = await executeDirectiveCompact(
+        ctx,
+        invocationFor(agentFor(s), 'keep the login details, drop the rest'),
+        CONFIG,
+      )
+      expect(result.kind).toBe('success')
+      if (result.kind !== 'success') return
+      expect(result.text).toContain('per the directive')
+      outcome = 'success'
+    } catch (error: unknown) {
+      // Shrink rejection throws a DirectiveCompactionError; the lifecycle is
+      // still closed and the surface is unchanged.
+      expect(error).toBeInstanceOf(DirectiveCompactionError)
+      const startIdx = s.events.findIndex(e => e.type === 'compaction/start')
+      const after = s.events.slice(startIdx)
+      expect(after.map(e => e.type)).toEqual(['compaction/start', 'compaction/end'])
+      expect(s.surface.nodes.length).toBe(surfaceBefore)
+      outcome = 'shrink-rejected'
+    }
+    if (outcome === 'shrink-rejected') return
 
     // Lifecycle appended: start, summary, user/message replace, end.
     const types = s.events.slice(-4).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
-
     // The summary event carries real provider facts and usage.
     const summaryEvent = s.events[s.events.length - 3]!
     const summaryData = summaryEvent.data as {
@@ -149,7 +185,6 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
     expect(summaryData.model).toBe('deepseek-v4-flash')
     expect(summaryData.usage?.inputTokens ?? 0).toBeGreaterThan(0)
     expect(summaryData.usage?.outputTokens ?? 0).toBeGreaterThan(0)
-
     // The middle span is gone from the surface, replaced by the checkpoint.
     expect(s.surface.nodes.length).toBeLessThan(surfaceBefore)
     const checkpoint = s.events[s.events.length - 2]!
@@ -160,4 +195,27 @@ describe.skipIf(key === undefined)('directive compaction with a real DeepSeek mo
       .join('\n')
     expect(summaryText.length).toBeGreaterThan(0)
   }, 120_000)
+
+  it('rejects an empty directive without calling the model (P7)', async () => {
+    const apiKeyValue = key as string
+    vi.stubEnv('DEEPSEEK_API_KEY', apiKeyValue)
+    const ctx = new Context()
+    contexts.push(ctx)
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(TokenMeter)
+    await ctx.plugin(LlmDeepSeek, {})
+
+    const s = sessionWithTurns(8)
+    const before = s.events.length
+    const result = await executeDirectiveCompact(
+      ctx,
+      invocationFor(agentFor(s), '   '),
+      CONFIG,
+    )
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') return
+    expect(result.text).toContain('/compact')
+    // No lifecycle opened, no model call, no surface change.
+    expect(s.events.length).toBe(before)
+  }, 30_000)
 })

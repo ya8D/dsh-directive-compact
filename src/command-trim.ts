@@ -86,6 +86,12 @@ export async function executeTrim(
   const session = invocation.agent.session
   const directive = invocation.rawInput.trim()
   if (directive.length === 0) {
+    // Returned as a structured error (not thrown) deliberately, mirroring
+    // `/compact-directive`: this is a parameter-validation failure — static,
+    // side-effect-free, before any `compaction/start` opens — so the command
+    // layer renders it as a usage hint. Failures DURING the lifecycle (shrink
+    // rejection, summarization) must throw so the catch block closes the
+    // opened lifecycle; the two failure styles are distinct on purpose.
     return {
       kind: 'error',
       text: 'Usage: /trim-directive <requirement> — a natural-language description of what to delete and what to keep',

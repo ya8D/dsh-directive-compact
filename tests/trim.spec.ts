@@ -208,16 +208,16 @@ describe('executeTrim', () => {
   it('rejects a trim whose checkpoint is not smaller than the shadowed span (shrink)', async () => {
     const s = sessionWithTurns(5)
     const ctx = fakeCtx(TRIM_CHUNKS)
-    // Shadowed content is 8 nodes (turns 2-5 user+assistant, after the
-    // injected skeleton); the meter prices those 8 at 10 each, then the framed
-    // checkpoint at 1000 — larger than the 80-token shadowed span.
-    let calls = 0
+    // Distinguish the framed checkpoint from the shadowed nodes by content:
+    // the checkpoint carries the trim marker + guard, the shadowed
+    // conversation messages do not. Survives estimateMessage call-count
+    // changes, unlike a positional "first N calls are shadowed" threshold.
     const inflated = {
       llm: ctx.llm,
       tokenMeter: {
-        estimateMessage: () => {
-          calls += 1
-          return calls > 8 ? 1000 : 10
+        estimateMessage: (message: { content: { type: string; text: string }[] }) => {
+          const text = message.content.map(b => b.text).join('')
+          return text.includes('[Directive trim, per requirement') ? 1000 : 10
         },
       },
     } as unknown as Pick<Context, 'llm' | 'tokenMeter'>
