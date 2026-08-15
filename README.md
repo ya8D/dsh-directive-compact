@@ -59,7 +59,10 @@ Both requirements are plain free text.
 
 ### When there is nothing to remove
 
-A trim/compaction that finds nothing worth changing is a **normal outcome, not a failure**: if the model's output is not smaller than the span it would replace (typically because it found nothing matching the requirement and returned the context essentially verbatim), the command reports a no-change success — `Nothing to trim: …` / `Nothing to compact: …` — records the model's output in the compaction lifecycle, and leaves the conversation exactly as it was. It never loops, retries, or hangs on a rewrite that cannot shrink. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns quickly with a message instead of churning for many minutes.)
+A trim/compaction that finds nothing worth changing is a **normal outcome, not a failure**:
+
+- **Per-chunk declaration (trim).** The trim prompt asks the model to first judge whether the requirement changes its chunk at all. If nothing needs deleting or rewriting, the model replies with exactly `<<NO_CHANGE>>` instead of regenerating the context; the command layer then keeps that chunk's **original rendering verbatim** in the checkpoint (the content must survive anyway, and paying the model to regenerate it is the entire wall-time cost). Only chunks with real changes spend time in the model. A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.
+- **Shrink validation.** If the assembled checkpoint is still not smaller than the span it replaces (e.g. every chunk declared no change), the command reports a no-change success — `Nothing to trim: …` / `Nothing to compact: …` — records the output in the compaction lifecycle, and leaves the conversation exactly as it was. It never loops, retries, or hangs on a rewrite that cannot shrink. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns with a message instead of churning for many minutes.)
 
 ### Where the command and its effect appear
 

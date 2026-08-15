@@ -16,9 +16,30 @@
  * "keep task goal / findings / next step" floor is imposed: the trim is the
  * user's explicit request to cut, and the model obeys it. The final
  * requirement line and the rendered history follow this prefix.
+ *
+ * The no-change contract: the model first judges whether the requirement
+ * changes ANY of the context. If nothing needs deleting or rewriting it must
+ * reply with exactly {@link TRIM_NO_CHANGE_MARKER} and nothing else — the
+ * command layer then keeps that chunk's original rendering verbatim instead of
+ * paying the model to regenerate it (a no-change chunk's content must survive
+ * in the checkpoint anyway, so regenerating it is pure waste).
  */
 export const TRIM_INSTRUCTION =
-  'Below is the current conversation context of an AI agent. Apply the user\'s trim requirement EXACTLY: delete what it asks to delete, keep what it asks to keep, and rewrite nothing that is kept. Output only the trimmed context — the user\'s own words must survive verbatim where kept. No pleasantries, no commentary, no tools. Here is the requirement:\n\n'
+  'Below is the current conversation context of an AI agent. Apply the user\'s trim requirement EXACTLY: delete what it asks to delete, keep what it asks to keep, and rewrite nothing that is kept. Output only the trimmed context — the user\'s own words must survive verbatim where kept. No pleasantries, no commentary, no tools.\n'
+  + 'First decide whether the requirement changes ANY of this context. If nothing needs to be deleted or rewritten, reply with exactly this line and nothing else: '
+  + '`<<NO_CHANGE>>`\n'
+  + 'Otherwise output the trimmed context as described above.\n'
+  + 'Here is the requirement:\n\n'
+
+/**
+ * Sentinel the model replies with when a trim requirement changes nothing in
+ * its input. Picked to be unreachable in real dialogue (the marker line is
+ * wrapped in backticks in the instruction so the model echoes it verbatim).
+ * The command layer treats a chunk whose whole text output equals this marker
+ * as no-change and keeps the chunk's original rendering instead of the
+ * model's output.
+ */
+export const TRIM_NO_CHANGE_MARKER = '<<NO_CHANGE>>'
 
 /**
  * Build the trim prompt for one call: the requirement verbatim, then the

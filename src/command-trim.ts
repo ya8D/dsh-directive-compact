@@ -22,16 +22,34 @@ import type {} from '@deepseek-ai/dsh-compaction/types'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { CommandInvocation } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, TextBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 // Type-only: activates the `ctx.tokenMeter` declaration on the Cordis context.
 import type {} from '@deepseek-ai/dsh-token-meter'
-import { summarizeWithDirective } from './summarizer.js'
+import { renderSpan, summarizeWithDirective } from './summarizer.js'
 import type { DirectiveSummaryResult, DirectiveTarget } from './summarizer.js'
 import { CHECKPOINT_GUARD } from './summarizer.js'
-import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, type PricedTrimNode, type TrimBudget } from './trim.js'
+import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, TRIM_NO_CHANGE_MARKER, type PricedTrimNode, type TrimBudget } from './trim.js'
 import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget } from './command.js'
 import { shortDirective } from './log.js'
+
+/**
+ * Whether a chunk call declared "nothing to change": its whole text output,
+ * trimmed and with wrapping backticks stripped, equals the no-change marker.
+ * Anything else (including a marker plus extra content) counts as changed and
+ * is assembled normally — a model that misuses the marker cannot silently drop
+ * content, it only fails to shrink that chunk.
+ * @param result - one chunk's summarization result.
+ * @returns true when the model replied with exactly the no-change marker.
+ */
+function isNoChangeMarker(result: DirectiveSummaryResult): boolean {
+  const text = (result.rawOutput ?? [])
+    .filter((block): block is TextBlock => block.type === 'text')
+    .map(block => block.text)
+    .join('')
+    .trim()
+  return text.replace(/^`+|`+$/g, '') === TRIM_NO_CHANGE_MARKER
+}
 
 /**
  * Select the trim range: the ENTIRE surface, with no system-node protection.
@@ -210,19 +228,25 @@ export async function executeTrim(
         session.id,
         invocation.signal,
       )
+      const noChange = isNoChangeMarker(result)
       logger.info(
-        'trim-directive: chunk %d/%d done in %dms (%d output tokens)',
+        'trim-directive: chunk %d/%d done in %dms (%d output tokens)%s',
         index + 1, chunks.length, Date.now() - chunkStartedAt, result.usage?.outputTokens ?? 0,
+        noChange ? ' — model declared no change; original content kept verbatim' : '',
       )
-      return { result, index }
+      return { result, index, chunkMessages, noChange }
     }))
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
     }
     logger.info('trim-directive: all %d chunks done in %dms', chunks.length, Date.now() - startedAt)
 
-    // Assemble one checkpoint: marker + guard once, then each chunk's text
-    // blocks under a [part N/M] divider.
+    // Assemble one checkpoint: marker + guard once, then each chunk's content
+    // under a [part N/M] divider. A chunk whose model call returned the
+    // no-change marker keeps its ORIGINAL rendering verbatim (the content must
+    // survive in the checkpoint anyway, and paying the model to regenerate it
+    // is the entire wall-time cost); a changed chunk contributes the model's
+    // trimmed output.
     const partCount = chunkResults.length
     const assembled: ContentBlock[] = [
       { type: 'text', text: trimMarker(directive) },
@@ -230,15 +254,19 @@ export async function executeTrim(
     ]
     const rawOutput: ContentBlock[] = []
     let usage: TokenUsage | undefined
-    for (const { result, index } of chunkResults) {
+    for (const { result, index, chunkMessages, noChange } of chunkResults) {
       if (partCount > 1) {
         assembled.push({ type: 'text', text: `[part ${index + 1}/${partCount}]` })
       }
-      for (const block of result.summary) {
-        // Skip the per-chunk marker/guard repeats; the single head covers them.
-        if (block.type === 'text'
-          && (block.text === trimMarker(directive) || block.text === CHECKPOINT_GUARD)) continue
-        assembled.push(block)
+      if (noChange) {
+        assembled.push({ type: 'text', text: renderSpan(chunkMessages) })
+      } else {
+        for (const block of result.summary) {
+          // Skip the per-chunk marker/guard repeats; the single head covers them.
+          if (block.type === 'text'
+            && (block.text === trimMarker(directive) || block.text === CHECKPOINT_GUARD)) continue
+          assembled.push(block)
+        }
       }
       rawOutput.push(...result.rawOutput ?? [])
       usage = mergeUsage(usage, result.usage)
