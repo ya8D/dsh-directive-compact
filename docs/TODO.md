@@ -29,17 +29,18 @@ Phased plan for `@ya8d/dsh-directive-compact`. Each phase ships its code and its
 - [x] Unit tests: prompt construction (with/without directive), renderSpan (text/tool blocks), summary marker/guard, image rejection, no-text rejection, finish-error mapping (max-tokens / error), oversized-input guard
 - [x] Typecheck + build green (32 tests total: 19 plan + 13 summarizer)
 
-## P3 — Command transaction
+## P3 — Command transaction + plugin entry
 
-- [ ] `src/command.ts` — `/compact-directive` handler: read session surface, plan spans, render middle, summarize, `session.append` replace with checkpoint source (`{ kind:'plugin', plugin:'compact', compactionId, sourceCommandId }`), `compaction/start`/`summary`/`end` lifecycle
-- [ ] Unit tests: checkpoint message shape, lifecycle event sequence, error translation
-- [ ] REAL-composition test: Loader boots cordis.yml, `/compact-directive` registered, `expect('default' in mod).toBe(false)`
+- [x] `src/command.ts` — `surfaceNodes` (surface → node descriptors), `resolveDirectiveTarget` (configured / routed / agent-options fallback), `executeDirectiveCompact` (plan → summarize middle → `session.append` replace with checkpoint source + `compaction/start`/`summary`/`end` lifecycle; failed attempts close the lifecycle with the error)
+- [x] `src/index.ts` — function plugin (`name`/`inject`/`apply`, no default export), `Config` schema (keepHeadUsers/keepTailUsers/summarization pair/maxTokens), registers `/compact-directive` via `ctx.effect` with handler drain
+- [x] Unit tests (`tests/command.spec.ts`): surfaceNodes source kinds, resolveDirectiveTarget fallbacks, executeDirectiveCompact (none for short session / middle compaction + lifecycle event sequence + checkpoint source / error closes lifecycle)
+- [x] REAL-composition test (`tests/loader-composition.spec.ts`): Loader boots cordis.yml with the plugin, `/compact-directive` registered; `expect('default' in mod).toBe(false)`; HMR-safety (dispose fiber → command unregistered)
+- [x] Typecheck + build green (41 tests total)
 
-## P4 — Plugin entry
+## P4 — Regression / polish
 
-- [ ] `src/index.ts` — `apply(ctx)` registers `/compact-directive` via `ctx.effect` (function plugin, no default export)
-- [ ] HMR-safety test: dispose fiber → command unregistered
-- [ ] Regression test: failed/cancelled directive compaction leaves no partial state
+- [ ] Regression test: a cancelled/failed directive compaction leaves the surface intact (lifecycle closed, no partial replace)
+- [ ] `cordis.patch.yml` — insert-only bundle row (currently declared in package.json; verify `--dump-config`)
 
 ## P5 — Bundle + verification
 
