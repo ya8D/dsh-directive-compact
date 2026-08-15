@@ -163,6 +163,23 @@ export async function executeDirectiveCompact(
   }
 
   const directive = invocation.rawInput.trim()
+  if (directive.length === 0) {
+    // The directive is the command's reason to exist; without one the plain
+    // four-point summary is the upstream `/compact`'s job (which also reuses
+    // the KV cache and its 8-section structure). Mirror its "no arguments"
+    // contract: refuse loudly instead of silently degrading to a weaker copy.
+    //
+    // Returned as a structured error (not thrown) deliberately: this is a
+    // parameter-validation failure — static, side-effect-free, before any
+    // `compaction/start` opens — so the command layer renders it as a usage
+    // hint. Failures DURING the lifecycle (shrink rejection, summarization)
+    // must throw so the catch block closes the opened lifecycle; the two
+    // failure styles are distinct on purpose.
+    return {
+      kind: 'error',
+      text: 'Usage: /compact-directive <requirement> — a natural-language description of what to keep and what to drop. For a plain summary with no requirement, use /compact.',
+    }
+  }
   const target = resolveDirectiveTarget(invocation.agent, config)
 
   // Middle span messages, in surface order, projected to the summarizer.
@@ -202,6 +219,20 @@ export async function executeDirectiveCompact(
       const message = messageFor(session, seq)
       return total + (message === null ? 0 : ctx.tokenMeter.estimateMessage(message))
     }, 0)
+    // Shrink validation (mirror of the upstream convergence check): the framed
+    // checkpoint must be smaller than the shadowed span, or the compaction
+    // would grow the context instead of shrinking it.
+    const checkpointMessage = createUserMessage({
+      content: summary.summary,
+      source: compactCheckpointSource(compactionId, invocation.commandId),
+    })
+    const framedTokenCount = ctx.tokenMeter.estimateMessage(checkpointMessage)
+    if (framedTokenCount >= shadowedTokenCount) {
+      throw new DirectiveCompactionError(
+        'summary',
+        `directive compaction did not shrink the context (checkpoint ${framedTokenCount} tokens >= shadowed ${shadowedTokenCount})`,
+      )
+    }
     const shadowedRange = {
       start: plan.middleSeqs[0]!,
       end: plan.middleSeqs[plan.middleSeqs.length - 1]!,
@@ -222,10 +253,6 @@ export async function executeDirectiveCompact(
       llmStreamCall: true,
     })
     committing = true
-    const checkpointMessage = createUserMessage({
-      content: summary.summary,
-      source: compactCheckpointSource(compactionId, invocation.commandId),
-    })
     session.append('user/message', checkpointMessage, {
       surfaceOp: { op: 'replace', start: shadowedRange.start, end: shadowedRange.end },
       sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...plan.middleSeqs],
