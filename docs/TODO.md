@@ -174,9 +174,55 @@ User hypothesis (confirmed against code): the "复杂对话 (1)" hang — `删�
 - README "When there is nothing to remove" section; CHANGELOG entry; DONE updated.
 - Typecheck + build green (72 unit + 3 e2e, real key).
 
+## P11 — Operation-mode trim（操作清单：模型决策 + 程序化执行）
+
+Motivation (user-confirmed, deep-dived): the rewrite mode's root problem is "output ≈ input". Real anchor "复杂对话3": 9 chunks / 362,509 ms / ~560K output tokens — every chunk that changes ANYTHING must decode ALL of its kept content (parallel, so wall time = slowest chunk ≈ 6 min), and kept content passes through the model's hands (verbatim rule protects only `[user]`; assistant/tool content can drift or lose facts). The `<<NO_CHANGE>>` status value (implemented, merged via PR #14) only covers the all-or-nothing edge — it does not speed up the "delete a little from a big surface" case. Operation mode makes the model a DECISION-MAKER instead of a content PRODUCER: it outputs a small operation manifest (delete / summarize), the plugin executes it programmatically — kept nodes are spliced verbatim (zero generation, 100% fidelity), only summary text is model-generated.
+
+### 设计（deep-dive 结论）
+
+- **输入格式（编号渲染，renderSpan 变体）**：编号 = **全局事件 seq**（复用 harness 原生 seq 体系——session 事件自带 seq、surface 节点即 seq 列表；`tool-session-query` 已用 `seq N` 让模型引用事件，用户真实指令也用过"删除 seq 1344493 那条消息"；无 surface 节点序号/编号渲染可复用，故直接复用 seq 而非自造分片内序号）。节点起始行 = `[seq <全局seq>] ` + 现有 role 前缀（`[user]` / `[assistant]` / `[tool] called tool …` / `[tool] tool result:`）；**节点内续块缩进 2 空格**（`  [role] …`）——编号行 = 节点边界，缩进 = 节点内。编号只存在于输入侧，checkpoint 拼接用无编号原文。seq 天然跨分片唯一 → **零映射**（校验即"该分片节点列表是否含此 seq"），块级编号留 Future。
+- **输出格式（严格清单模板，一行一操作 + 内容块）**：
+  - `delete: 28039, 28045`——整节点删除（逗号列表 + `28040-28045` 范围；seq 数字来自渲染 `[seq N]` 照抄，零生成）
+  - `rewrite: 28039` + `---content---` … `---end---` 内容块——**节点内部分修改**（内容 = 该节点完整替换版本，纯内容不带编号/角色前缀；插件按原节点角色拼回 `[role] ` 前缀，与无操作节点格式一致。**缺内容块或内容为空 → 校验失败回退**）
+  - `summarize: 28040-28045` + `---content---` … `---end---` 内容块（摘要纯文本，直接插入替换整个范围）
+  - 无操作：单独一行 `<<NO_CHANGE>>`（或空输出 = no-change）
+  - 规则：操作行从行首开始；内容块内任何内容原样（含空行），但不得包含 `---end---` 行
+- **节点内部分删除的分布影响（诚实修正）**：telemetry 类提及若**集中**在少数节点 → 仅那几节点 rewrite，其余节点原文拼接（接近零生成）；若**散布**在大量节点 → 逐节点 rewrite = 重写大部分节点（提速有限——散布删除语义上就需要大面积修改，无免费午餐）。提速幅度取决于提及集中度，实测锚定。
+- **解析 + 校验（正确性优先）**：格式错误/散文输出 → **回退重写式**（现有 TRIM_INSTRUCTION 路径重新调用一次，代码已存在）；编号越界 / delete 与 summarize/rewrite 重叠 / 缺内容块或为空 / 拆散 tool-call-result 对（delete 一侧必须连另一侧；rewrite tool-call 不配 result → 回退）/ 未知操作行 / `---content---`/`---end---` 不配对 → 回退；空清单 → no-change。**任何不确定都回退，绝不半执行。**
+- **执行（拼接 checkpoint）**：每片 = 无操作节点原文（renderSpan 形态，与重写式输出形态一致）拼接 + rewrite 节点替换为模型内容（插件加 role 前缀）+ summarize 范围替换为摘要 + delete 节点跳过；多片 `[part N/M]`；checkpoint = marker + guard + parts；shrink 校验、lifecycle、tool-pair 平衡照旧。
+- **禁止整片摘要化**：summarize 范围必须模型显式指出；范围外节点一律原文拼接，一个字不改（否则 trim 悄悄变成 compact）。"删 telemetry + 把登录流程压成要点"的混合指令一次表达。
+- **双模式分流（第一版简化）**：操作模式 prompt 只要求清单输出；解析失败回退重写式（一次重新调用）。模型声明模式 / 单次调用双格式分流留作增强。
+- **增强候选（Future）**：`delete-text: 28039, "精确字符串"`——模型引用原文片段，插件做字符串匹配删除（零生成、零漂移）；但模型引用可能与原文不一致 → 匹配失败回退 rewrite。第一版用 rewrite（更稳），delete-text 作增强。
+
+### 预期收益（估算，待实测）
+
+- 输出 560K → ~125K tokens（清单 + 小摘要 + 省不掉的 reasoning ~12.7K/片）→ 362s → 90-150s（3-4 倍）
+- **保真（本质改进）**：保留节点零生成 → 100% 原文，无漂移无幻觉；trim 从"模型重写"变成"模型决策 + 程序化执行"
+- 可审计：删除决策显式可见，插件可校验；模型漏删 → 保留更多 → shrink 失败 → no-change 提示（错误可见，不静默）
+
+### 风险与边界（诚实）
+
+- 模型遵守清单格式是最大不确定性；不遵守 → 回退（正确但无提速）
+- reasoning 省不掉 → 提速有下限（"1 分钟内"做不到，除非压 thinking = 质量权衡）
+- "批量改写"类指令（50 条都改）清单会膨胀 → 边界退化；此时模型输出全文走重写路径
+- 保真第一版用渲染文本；原始 ContentBlock 拷贝（tool-result 结构）需验证 user-message 的配对约束 → Future 增强
+- 编号指认准确性（模型指错编号）→ 越界校验回退；指认漏删 → shrink 兜底
+
+### 工作项
+
+- [x] 编号渲染（renderSpan 变体 `renderSpanNumbered`，`[seq N]` 全局 seq 复用）+ 操作模式 prompt（`buildOpModePrompt`，delete/rewrite/summarize 三类 + `---content---`/`---end---` 块 + `<<NO_CHANGE>>`）
+- [x] 清单解析器（`parseOpManifest`：delete 列表/范围、rewrite/summarize 内容块、no-change、散文/未知行/缩进行/缺块/未配对分隔符/marker 混用全部 reject）
+- [x] 校验器（`validateOpManifest`：越界/重叠/summarize 边界缺失或反转/操作区间 tool-pair 边界平衡——工具对要么整体在操作区间内要么整体在外）→ 回退重写式
+- [x] 执行器（`executeOpManifest`：无操作节点原文拼接 + rewrite 替换（插件加 role 前缀）+ summarize 摘要替换 + delete 跳过）
+- [x] 集成：`summarizeChunkWithRetry` 增 promptBuilder/markerBuilder/renderer 参数；每片操作模式优先，解析/校验失败回退重写式（合并两次调用的 usage）；`summarizeWithDirective` 增 renderer 参数
+- [x] 单元测试（op-mode.spec.ts 22 个：渲染/prompt/解析/校验/执行；trim.spec.ts +2 命令级 delete/rewrite 端到端 + 既有断言适配双调用）
+- [ ] 真实会话验证：提速幅度（对比 362s 基线，按提及集中度分档）+ 保真（保留节点与原文逐字一致）
+- [x] README（操作模式说明）/ CHANGELOG / 本条目
+- [ ] Agent Note（`2026-08-16-operation-mode-trim.md`）
+
 ## Future — Deferred / optional（先不标 P，需要实施时临时升级为 P##）
 
-- [x] Trim 提速（核心，用户实测锚点 "复杂对话3"：366K heuristic tokens / 8-9 片并行 / 6 分 2 秒成功压缩）：已实施**no-change 状态值**方案——trim prompt 让模型先判断该片是否需要改动；无改动则只回复 `<<NO_CHANGE>>`，命令层将该片**原渲染文本 verbatim 保留**进 checkpoint（内容反正要保留，模型逐 token 重写是纯浪费）。只有真正改动的片耗时。实测预期：telemetry 类场景从"9 片全部重写 ~350K tokens（6 分钟）"降到"仅含 telemetry 的片重写"。剩余可做：真实会话验证提速幅度、模型误判（该删不删）的措辞校准。
+- [x] Trim 提速（核心）：`<<NO_CHANGE>>` 状态值已实施（PR #14）——只解决"全无可删"的边角，**不解决**"删一点点"场景（P11 承担）。剩余：真实会话验证、模型误判措辞校准。
 - [ ] Trim latency 其余项：progress feedback（"compressing chunk N/M" / 已耗时）、cap the rendered input（先压缩再 trim）、timeout/abort affordance。README Known Limitations 已有耗时说明。
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek

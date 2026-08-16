@@ -173,6 +173,9 @@ function summarizationError(finish: FinishReason): Error | undefined {
  * @param markerBuilder - overrides the directive marker prepended to the
  *   summary; defaults to `checkpointMarker`. The trim command passes
  *   `trimMarker` so the landed checkpoint identifies itself as a trim.
+ * @param renderer - overrides how the span is rendered into the prompt;
+ *   defaults to `renderSpan`. The operation-mode trim passes a numbered
+ *   renderer so the model can reference nodes by seq.
  * @returns the safe text summary and the exact call envelope.
  */
 export async function summarizeWithDirective(
@@ -184,8 +187,9 @@ export async function summarizeWithDirective(
   signal?: AbortSignal,
   promptBuilder: (directive: string | undefined) => string = buildSummaryPrompt,
   markerBuilder: (directive: string) => string = checkpointMarker,
+  renderer: (messages: readonly Message[]) => string = renderSpan,
 ): Promise<DirectiveSummaryResult> {
-  const rendered = renderSpan(messages)
+  const rendered = renderer(messages)
   if (rendered.length > MAX_RENDERED_INPUT_CHARS) {
     throw new Error(
       `directive summarization input too large (${rendered.length} rendered chars > ${MAX_RENDERED_INPUT_CHARS}); `

@@ -57,11 +57,25 @@ Both requirements are plain free text.
 | Result | One checkpoint replacing the middle | One checkpoint replacing the whole surface |
 | Use case | Routine context compression with a focus | Aggressive / surgical deletion the head-protected command cannot reach |
 
+### Operation mode (how a trim actually cuts)
+
+`/trim-directive` first runs every chunk in **operation mode**: the model sees the chunk as numbered nodes (`[seq 28039] [user] …`, reusing the harness's global event seq — the same numbering `session-query` uses) and replies with a small **operation manifest** instead of regenerating the whole context:
+
+```
+delete: 28039, 28045          remove whole nodes
+rewrite: 28039                replace one node (partial edits) → its full new text
+summarize: 28040-28045        replace a range with a short summary
+---content--- … ---end---     (the replacement text for rewrite/summarize)
+<<NO_CHANGE>>                 nothing to change in this chunk
+```
+
+The plugin then **executes the manifest programmatically**: untouched nodes splice into the checkpoint **verbatim** (zero generation — 100% fidelity, no drift, no hallucination), deleted nodes drop, rewritten nodes take the model's content, summarized ranges take the summary. Only the changed nodes spend time in the model — a trim that touches a few nodes of a large session no longer pays for regenerating the ~350K tokens that stay the same. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) **falls back to the rewrite mode** below — the plugin never half-executes.
+
 ### When there is nothing to remove
 
 A trim/compaction that finds nothing worth changing is a **normal outcome, not a failure**:
 
-- **Per-chunk declaration (trim).** The trim prompt asks the model to first judge whether the requirement changes its chunk at all. If nothing needs deleting or rewriting, the model replies with exactly `<<NO_CHANGE>>` instead of regenerating the context; the command layer then keeps that chunk's **original rendering verbatim** in the checkpoint (the content must survive anyway, and paying the model to regenerate it is the entire wall-time cost). Only chunks with real changes spend time in the model. A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.
+- **Per-chunk declaration (trim).** If the requirement changes nothing in a chunk, the model replies with exactly `<<NO_CHANGE>>` (or an empty manifest); the command layer keeps that chunk's **original rendering verbatim** in the checkpoint (the content must survive anyway, and paying the model to regenerate it is the entire wall-time cost). A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.
 - **Shrink validation.** If the assembled checkpoint is still not smaller than the span it replaces (e.g. every chunk declared no change), the command reports a no-change success — `Nothing to trim: …` / `Nothing to compact: …` — records the output in the compaction lifecycle, and leaves the conversation exactly as it was. It never loops, retries, or hangs on a rewrite that cannot shrink. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns with a message instead of churning for many minutes.)
 
 ### Where the command and its effect appear
