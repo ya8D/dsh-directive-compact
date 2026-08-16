@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { createMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { CallId, createMessage, createToolResultMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
@@ -380,8 +380,8 @@ describe('executeTrim', () => {
     const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
     // The first stream call (op-mode) fails transiently and its retry succeeds;
-    // the prose output then falls back to a rewrite-mode call.
-    expect(streamCalls).toBe(3) // op-mode: 1 initial + 1 retry; rewrite fallback: 1
+    // the prose output is reused as-is (no second rewrite call).
+    expect(streamCalls).toBe(2) // op-mode: 1 initial + 1 retry
     const types = s.events.slice(before).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
   })
@@ -468,10 +468,10 @@ describe('executeTrim', () => {
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
     // 13 nodes × 15K = 195K > 50K chunk budget → chunks of 3 nodes (45K):
-    // 13 nodes = 4 full chunks + 1 remainder chunk = 5 chunks. Each chunk
-    // runs an op-mode call whose prose output falls back to a rewrite-mode
-    // call → 5 × 2 = 10 stream calls.
-    expect(streamCalls).toBe(10)
+    // 13 nodes = 4 full chunks + 1 remainder chunk = 5 chunks. Every chunk's
+    // op-mode prose output is reused as-is (no second rewrite call) → 5
+    // stream calls (one per chunk).
+    expect(streamCalls).toBe(5)
     // Lifecycle still start → summary → replace → end.
     const types = s.events.slice(before).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
@@ -483,9 +483,9 @@ describe('executeTrim', () => {
     expect(text).toContain('[part 5/5]')
     // The single head marker appears once; part bodies are appended.
     expect(text.split('[Directive trim, per requirement: drop all]').length - 1).toBe(1)
-    // Usage is merged across all 10 calls.
+    // Usage is merged across the 5 calls.
     const usage = (summaryEvent.data as { usage?: { inputTokens: number } }).usage
-    expect(usage?.inputTokens).toBe(10)
+    expect(usage?.inputTokens).toBe(5)
   })
 
   it('logs phase milestones with timings for a multi-chunk trim', async () => {
@@ -610,9 +610,9 @@ describe('executeTrim', () => {
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
     // 13 nodes × 15K = 195K > 50K → 5 chunks. Chunk 1 declares no change in
-    // its op-mode call (1 stream call, no fallback); chunks 2-5 output prose,
-    // so each falls back to a rewrite-mode call (2 stream calls each) → 9.
-    expect(streamCalls).toBe(9)
+    // its op-mode call (1 stream call); chunks 2-5 output prose, which is
+    // reused as-is (1 stream call each, no second call) → 5 total.
+    expect(streamCalls).toBe(5)
     const text = checkpointText(s)
     // Chunk 1's original rendering survives verbatim (the role-prefixed span).
     expect(text).toContain('[part 1/5]')
@@ -679,5 +679,243 @@ describe('executeTrim', () => {
     // The node's role prefix is re-added; the model content replaces the node.
     expect(text).toContain('[user] rewritten task')
     expect(text).not.toContain('[user] first task')
+  })
+
+  it('P11 regression (real-run finding): reuses prose op-mode output with ONE call per chunk', async () => {
+    // Real "复杂对话4" run: the model emitted prose on 9/9 chunks and the old
+    // fallback made a SECOND rewrite call per chunk → 13.8 min (2.3× the
+    // rewrite baseline). The prose output IS the model's rewrite; reusing it
+    // must cost exactly one stream call per chunk.
+    const s = sessionWithTurns(5)
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          for (const chunk of TRIM_CHUNKS) yield chunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    // One chunk (13 nodes × 10 tokens = 130 ≤ 50K) → exactly ONE call; the
+    // prose output lands in the checkpoint without a second rewrite call.
+    expect(streamCalls).toBe(1)
+    expect(checkpointText(s)).toContain('trimmed context')
+  })
+
+  it('P11: a parseable but invalid manifest falls back to ONE rewrite call', async () => {
+    // A well-formed manifest with an out-of-range seq cannot execute (the
+    // op-mode output is a manifest, NOT usable as content), so the rewrite
+    // call runs once: 2 stream calls total for the chunk.
+    const s = sessionWithTurns(5)
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          if (streamCalls === 1) {
+            const text = 'delete: 999999'
+            yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+            yield { type: 'text-delta', index: 0, text } as StreamChunk
+            yield { type: 'block-end', index: 0, block: { type: 'text', text } } as StreamChunk
+            yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+          } else {
+            for (const chunk of TRIM_CHUNKS) yield chunk
+          }
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(2) // op call + rewrite fallback
+    const text = checkpointText(s)
+    expect(text).toContain('trimmed context') // the rewrite call's output
+    expect(text).not.toContain('delete:')
+  })
+
+  /** Session with one tool call/result pair: [user1, asst1, user2, call, result]. */
+  function sessionWithToolTurn(): Session {
+    const s = Session.create(SessionId('trim-tool-test'))
+    appendTurn(s, 1, 'first task', 'first answer')
+    s.append('turn/start', { turn: 2 })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'run read' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('step/start', { turn: 2, step: 1 })
+    s.append('assistant/message', {
+      turn: 2,
+      step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: CallId('t-call-1'), name: 'read', arguments: '{}' }],
+        source: { kind: 'model', provider: 'mock', model: 'mock' },
+      }),
+    }, { surfaceOp: 'append' })
+    s.append('step/end', { turn: 2, step: 1 })
+    s.append('tool/result', {
+      turn: 2,
+      step: 1,
+      message: createToolResultMessage({
+        callId: CallId('t-call-1'),
+        content: [{ type: 'text', text: 'telemetry payload here' }],
+        isError: false,
+      }),
+    }, { surfaceOp: 'append' })
+    s.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    return s
+  }
+
+  it('P11 fix: rewrites a tool-result node (partial telemetry) with ONE call — no pair-balance rejection', async () => {
+    // "delete a little telemetry inside a tool result" must be a rewrite of
+    // that single node: the node stays, the call/result structure is intact,
+    // so the trim must NOT fall back to a rewrite call over pair balance.
+    const s = sessionWithToolTurn()
+    const resultSeq = s.surface.nodes[4]!
+    const rewrite = `rewrite: ${resultSeq}\n---content---\npayload without telemetry\n---end---`
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+          yield { type: 'text-delta', index: 0, text: rewrite } as StreamChunk
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: rewrite } } as StreamChunk
+          yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'remove telemetry from the result'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(1) // executed in op mode — no fallback call
+    const text = checkpointText(s)
+    expect(text).toContain('[user] payload without telemetry') // rewritten result (role prefix re-added)
+    expect(text).not.toContain('telemetry payload here')
+    expect(text).toContain('[assistant] called tool read') // the call stays intact
+  })
+
+  it('P11 fix: extends a one-sided delete of a tool result to its call with ONE call', async () => {
+    // The model wants the whole tool record gone but names only the result;
+    // the plugin pulls the paired call in and executes — no fallback call.
+    const s = sessionWithToolTurn()
+    const resultSeq = s.surface.nodes[4]!
+    const manifest = `delete: ${resultSeq}`
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+          yield { type: 'text-delta', index: 0, text: manifest } as StreamChunk
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: manifest } } as StreamChunk
+          yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'delete the read result'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(1) // executed in op mode — no fallback call
+    const text = checkpointText(s)
+    expect(text).not.toContain('telemetry payload here') // result gone
+    expect(text).not.toContain('called tool read') // paired call pulled in
+    expect(text).toContain('[user] first task') // everything else verbatim
+  })
+
+  it('P11 fix: rewrites a tool-call node by auto-deleting its paired result (ONE call)', async () => {
+    // Real run (chunk 5, seq 16219): the model rewrote an assistant node that
+    // CARRIES tool calls (text + subagent calls). The rewrite replaces the
+    // whole node, so its paired results are auto-extended into deletes —
+    // executed in op mode, no fallback call.
+    const s = sessionWithToolTurn()
+    const callSeq = s.surface.nodes[3]!
+    const rewrite = `rewrite: ${callSeq}\n---content---\nreplaced call text\n---end---`
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+          yield { type: 'text-delta', index: 0, text: rewrite } as StreamChunk
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: rewrite } } as StreamChunk
+          yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'rewrite the call message'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(1) // executed in op mode — no fallback call
+    const text = checkpointText(s)
+    expect(text).toContain('[assistant] replaced call text') // the rewritten node
+    expect(text).not.toContain('called tool read') // the call is gone with the node
+    expect(text).not.toContain('telemetry payload here') // paired result auto-deleted
+    expect(text).toContain('[user] first task') // everything else verbatim
+  })
+
+  it('P11 fix: a delete+rewrite pair conflict is rejected and falls back to a rewrite call', async () => {
+    // `delete: <call>` + `rewrite: <result>`: the delete extension must NOT
+    // silently pull the rewritten result into deletes; the conflict rejects
+    // and the rewrite-mode fallback produces the result.
+    const s = sessionWithToolTurn()
+    const callSeq = s.surface.nodes[3]!
+    const resultSeq = s.surface.nodes[4]!
+    const manifest = `delete: ${callSeq}\nrewrite: ${resultSeq}\n---content---\nkept result content\n---end---`
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          if (streamCalls === 1) {
+            yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+            yield { type: 'text-delta', index: 0, text: manifest } as StreamChunk
+            yield { type: 'block-end', index: 0, block: { type: 'text', text: manifest } } as StreamChunk
+            yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+          } else {
+            for (const chunk of TRIM_CHUNKS) yield chunk
+          }
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop the call, keep the result'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(2) // op call rejected → rewrite fallback call
+    const text = checkpointText(s)
+    expect(text).toContain('trimmed context') // the fallback's output
+    expect(text).not.toContain('kept result content') // the conflicted manifest did not execute
   })
 })

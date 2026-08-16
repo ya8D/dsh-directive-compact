@@ -30,7 +30,7 @@ import { renderSpan, summarizeWithDirective } from './summarizer.js'
 import type { DirectiveSummaryResult, DirectiveTarget } from './summarizer.js'
 import { CHECKPOINT_GUARD } from './summarizer.js'
 import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, TRIM_NO_CHANGE_MARKER, type PricedTrimNode, type TrimBudget } from './trim.js'
-import { buildOpModePrompt, executeOpManifest, parseOpManifest, renderSpanNumbered, validateOpManifest } from './op-mode.js'
+import { buildOpModePrompt, executeOpManifest, parseOpManifest, renderSpanNumbered, validateOpManifest, type OpManifest } from './op-mode.js'
 import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget } from './command.js'
 import { shortDirective } from './log.js'
 
@@ -249,20 +249,45 @@ export async function executeTrim(
       )
       const parsed = parseOpManifest(resultText(opCall))
       if (parsed.kind === 'manifest') {
-        const invalid = validateOpManifest(parsed.manifest, chunk.seqs, session)
-        if (invalid === null) {
-          const content = executeOpManifest(parsed.manifest, chunk.seqs, session)
+        const validation = validateOpManifest(parsed.manifest, chunk.seqs, session)
+        if (validation.kind === 'ok') {
+          const content = executeOpManifest(validation.manifest, chunk.seqs, session)
           logger.info(
             'trim-directive: chunk %d/%d done in %dms (op-mode: %d delete, %d rewrite, %d summarize)',
             index + 1, chunks.length, Date.now() - chunkStartedAt,
-            parsed.manifest.deletes.length, parsed.manifest.rewrites.size, parsed.manifest.summarizes.length,
+            validation.manifest.deletes.length, validation.manifest.rewrites.size, validation.manifest.summarizes.length,
           )
           return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
         }
-        logger.debug(
-          'trim-directive: chunk %d/%d op manifest rejected (%s); falling back to rewrite mode',
+        const invalid = validation.reason
+        // The manifest parses but is semantically invalid (out-of-range seqs,
+        // overlaps, split tool pairs — rare, meaning the model misread the
+        // nodes). A second rewrite-mode call is the correct-cost fallback:
+        // the op-mode output is a manifest here, NOT usable as content.
+        logger.warn(
+          'trim-directive: chunk %d/%d op manifest invalid: %s\n'
+          + '  manifest: %s\n'
+          + '  model output (first 400 chars): %s',
           index + 1, chunks.length, invalid,
+          manifestSummary(parsed.manifest),
+          JSON.stringify(resultText(opCall).slice(0, 400)),
         )
+        const result = await summarizeChunkWithRetry(
+          ctx,
+          target,
+          budget,
+          chunkMessages,
+          directive,
+          session.id,
+          invocation.signal,
+        )
+        const noChange = isNoChangeMarker(result)
+        logger.info(
+          'trim-directive: chunk %d/%d done in %dms (rewrite-mode fallback, %d output tokens)%s',
+          index + 1, chunks.length, Date.now() - chunkStartedAt, result.usage?.outputTokens ?? 0,
+          noChange ? ' — model declared no change; original content kept verbatim' : '',
+        )
+        return { kind: 'rewrite', result, index, chunkMessages, noChange, usage: mergeUsage(opCall.usage, result.usage) }
       } else if (parsed.kind === 'no-change') {
         const content = executeOpManifest(null, chunk.seqs, session)
         logger.info(
@@ -271,23 +296,25 @@ export async function executeTrim(
         )
         return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
       }
-      // Fallback: the rewrite-mode call (the model's free-form trimmed output).
-      const result = await summarizeChunkWithRetry(
-        ctx,
-        target,
-        budget,
-        chunkMessages,
-        directive,
-        session.id,
-        invocation.signal,
+      // Prose output: the model chose FORM 2 (or ignored the prompt). Its
+      // Prose output: the model chose FORM 2 (or ignored the prompt). Its
+      // output IS its rewrite of the chunk, so reuse it directly — a second
+      // rewrite call would double the wall time of the slowest chunk (measured
+      // on a real run: op prose + fallback ≈ 14 min for one 45K-token chunk).
+      // `noChange` is always false here: parseOpManifest already classified
+      // this output as prose using the SAME marker test isNoChangeMarker uses,
+      // so a marker-only reply can never reach this branch.
+      logger.warn(
+        'trim-directive: chunk %d/%d op-mode prose output (%s); using it as the rewrite result (no second call)\n'
+        + '  model output (first 400 chars): %s',
+        index + 1, chunks.length, parsed.reason,
+        JSON.stringify(resultText(opCall).slice(0, 400)),
       )
-      const noChange = isNoChangeMarker(result)
       logger.info(
-        'trim-directive: chunk %d/%d done in %dms (rewrite mode, %d output tokens)%s',
-        index + 1, chunks.length, Date.now() - chunkStartedAt, result.usage?.outputTokens ?? 0,
-        noChange ? ' — model declared no change; original content kept verbatim' : '',
+        'trim-directive: chunk %d/%d done in %dms (op-mode prose as rewrite result, %d output tokens)',
+        index + 1, chunks.length, Date.now() - chunkStartedAt, opCall.usage?.outputTokens ?? 0,
       )
-      return { kind: 'rewrite', result, index, chunkMessages, noChange, usage: mergeUsage(opCall.usage, result.usage) }
+      return { kind: 'rewrite', result: opCall, index, chunkMessages, noChange: false, usage: opCall.usage }
     }))
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
@@ -482,6 +509,15 @@ function resultText(result: DirectiveSummaryResult): string {
     .filter((block): block is TextBlock => block.type === 'text')
     .map(block => block.text)
     .join('\n')
+}
+
+/** One-line summary of a parsed manifest for diagnostics. */
+function manifestSummary(manifest: OpManifest): string {
+  const parts: string[] = []
+  if (manifest.deletes.length > 0) parts.push(`delete [${manifest.deletes.join(', ')}]`)
+  if (manifest.rewrites.size > 0) parts.push(`rewrite [${[...manifest.rewrites.keys()].join(', ')}]`)
+  for (const range of manifest.summarizes) parts.push(`summarize [${range.start}-${range.end}]`)
+  return parts.length === 0 ? '(empty)' : parts.join('; ')
 }
 
 /** Sum disjoint provider usage buckets across chunk calls. */

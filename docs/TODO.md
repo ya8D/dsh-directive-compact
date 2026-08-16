@@ -216,9 +216,16 @@ Motivation (user-confirmed, deep-dived): the rewrite mode's root problem is "out
 - [x] 执行器（`executeOpManifest`：无操作节点原文拼接 + rewrite 替换（插件加 role 前缀）+ summarize 摘要替换 + delete 跳过）
 - [x] 集成：`summarizeChunkWithRetry` 增 promptBuilder/markerBuilder/renderer 参数；每片操作模式优先，解析/校验失败回退重写式（合并两次调用的 usage）；`summarizeWithDirective` 增 renderer 参数
 - [x] 单元测试（op-mode.spec.ts 22 个：渲染/prompt/解析/校验/执行；trim.spec.ts +2 命令级 delete/rewrite 端到端 + 既有断言适配双调用）
-- [ ] 真实会话验证：提速幅度（对比 362s 基线，按提及集中度分档）+ 保真（保留节点与原文逐字一致）
-- [x] README（操作模式说明）/ CHANGELOG / 本条目
-- [ ] Agent Note（`2026-08-16-operation-mode-trim.md`）
+- [x] **真实会话验证（"复杂对话4" `session-ebd5011a`，失败暴露）**：199 节点 / 366,720 tokens / 9 片，`删除telemetry相关的内容` → **830,451 ms（13.8 分钟）**，比重写式基线（362s）慢 2.3 倍。rawOutput blocks = 18 = **9 片 × 2 次调用/片**：模型 **9/9 片全部输出散文**（未遵守清单），每片 op 散文重写 + fallback 重写式二次调用 → 双倍成本。telemetry 127→0 ✓、lifecycle 完整 ✓（功能正确，性能不可接受）
+- [x] **修复（方案 B，实测驱动）**：`buildOpModePrompt` 改**双格式**（FORM 1 清单优先 / FORM 2 全文合法化——模型散文从此是合法选择，质量与重写式相当）；`command-trim.ts` 分流：**散文（parse invalid）→ 直接复用 op 输出当重写结果（1 次调用，warn 日志）**；**清单 parse 成功但 validate 失败（seq 越界等，罕见）→ 才二次调用重写式**（此时 op 输出是清单不可作内容）。最坏 = 重写式基线 1 次调用
+- [x] **回归测试（用户要求"为什么没测出来"）**：新增 `P11 regression: reuses prose op-mode output with ONE call per chunk`（断言 1 次调用 + 散文落地）与 `parseable but invalid manifest falls back to ONE rewrite call`（断言 2 次调用 + 回退输出）；既有散文路径断言从双调用改回单调用（3→2、10→5、9→5）；prompt 测试补 FORM 2 断言。100 单元 + 3 e2e
+- [x] **配对修复（TDD：先写测试后实现，105 全绿）**——真实日志（web-20260816-144813.log）显示 3 片因 `operations starting at seq X split a tool call/result pair` 回退（147-355s）：模型的操作区间从 result 开始而 call 留在区间外（模型不懂 tool-pair 约束）。修复分层（用户确认"90% 以上避免回退"）：
+  - **rewrite 豁免**：rewrite 是内容级修改（节点保留、结构不变）——仅拒绝 rewrite tool-call 节点（会使其 result 失配）；rewrite tool-result/文本节点直接允许。"result 里删一点点 telemetry" = rewrite 单节点，绝不整节点/连 call 删除
+  - **delete/summarize 配对扩展**：单侧引用（只 call 或只 result）→ 按 callId 自动纳入配对节点（须在本 chunk，跨 chunk 才拒绝）→ 零额外 LLM 调用。模型删 result 时插件自动连 call 删（整条工具记录）
+  - **parseOpManifest 反引号 marker**：`` `<<NO_CHANGE>>` `` 识别为 no-change（与 isNoChangeMarker 一致，修 chunk 5 误报）
+  - validateOpManifest 新签名 `{kind:'ok', manifest} | {kind:'invalid', reason}`（返回扩展后的 manifest）
+  - 新增测试：反引号 marker；rewrite result 豁免；rewrite call 拒绝；delete 单侧扩展（双向）；summarize 单侧扩展；命令级 rewrite result 1 次调用 / delete 单侧 1 次调用
+- [ ] Agent Note（`2026-08-16-operation-mode-trim.md`）补充实测与方案 B + 配对修复
 
 ## Future — Deferred / optional（先不标 P，需要实施时临时升级为 P##）
 
