@@ -94,13 +94,21 @@ describe('renderSpanNumbered', () => {
 })
 
 describe('buildOpModePrompt', () => {
-  it('teaches the manifest grammar and embeds the directive verbatim', () => {
+  it('teaches the manifest grammar, the full-rewrite alternative, and embeds the directive verbatim', () => {
     const prompt = buildOpModePrompt('delete telemetry')
     expect(prompt).toContain('delete:')
     expect(prompt).toContain('rewrite:')
     expect(prompt).toContain('summarize:')
     expect(prompt).toContain('---content---')
     expect(prompt).toContain(TRIM_NO_CHANGE_MARKER)
+    // Form 2: a full rewrite is a legal reply (the plugin reuses it as-is).
+    expect(prompt).toContain('FORM 2')
+    expect(prompt).toContain('trimmed context in full')
+    // Node-targeting guidance: edit a result's content via the result node,
+    // never a tool-call node (which deletes the call AND its result); prefer
+    // delete over rewrite for whole-node removal.
+    expect(prompt).toContain('NEVER a tool-call node')
+    expect(prompt).toContain('Prefer delete over rewrite')
     expect(prompt).toContain('delete telemetry')
   })
   it('fails loud on an empty requirement', () => {
@@ -166,46 +174,125 @@ describe('parseOpManifest', () => {
     expect(parseOpManifest('summarize: 5-3')).toMatchObject({ kind: 'invalid' })
     expect(parseOpManifest('rewrite: 1-2')).toMatchObject({ kind: 'invalid' })
   })
+  it('treats backtick-wrapped no-change markers as no-change (matches isNoChangeMarker)', () => {
+    // The model may echo the marker wrapped in backticks (the prompt quotes it);
+    // this must be no-change, not an invalid prose fallback.
+    expect(parseOpManifest('`<<NO_CHANGE>>`')).toEqual({ kind: 'no-change' })
+    expect(parseOpManifest('``<<NO_CHANGE>>``')).toEqual({ kind: 'no-change' })
+  })
 })
 
 describe('validateOpManifest', () => {
-  it('accepts a manifest whose seqs are all chunk members with balanced boundaries', () => {
+  it('accepts a balanced manifest and returns it unchanged', () => {
     const s = fixtureSession()
     const seqs = s.surface.nodes
     const manifest: OpManifest = { deletes: [seqs[0]!], rewrites: new Map(), summarizes: [] }
-    expect(validateOpManifest(manifest, seqs, s)).toBeNull()
+    const result = validateOpManifest(manifest, seqs, s)
+    expect(result).toMatchObject({ kind: 'ok' })
+    if (result.kind === 'ok') expect(result.manifest).toEqual(manifest)
   })
   it('rejects seqs outside the chunk and overlaps', () => {
     const s = fixtureSession()
     const seqs = s.surface.nodes
     expect(validateOpManifest({ deletes: [999_999], rewrites: new Map(), summarizes: [] }, seqs, s))
-      .toContain('not in this chunk')
+      .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('not in this chunk') })
     const manifest: OpManifest = {
       deletes: [seqs[0]!],
       rewrites: new Map([[seqs[0]!, 'x']]),
       summarizes: [],
     }
-    expect(validateOpManifest(manifest, seqs, s)).toContain('overlap')
+    expect(validateOpManifest(manifest, seqs, s))
+      .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('overlap') })
   })
-  it('rejects deleting only one side of a tool pair, accepts the whole pair', () => {
+  it('extends a one-sided delete to the whole tool pair (no fallback)', () => {
     const s = fixtureSession()
     const seqs = s.surface.nodes
     // seqs: [user1, assistant1, user2, call, result, user3, assistant3]
-    const callIdx = seqs.findIndex((_, i) => i === 3)
-    const call = seqs[callIdx]!
-    const result = seqs[callIdx + 1]!
-    expect(validateOpManifest({ deletes: [call], rewrites: new Map(), summarizes: [] }, seqs, s))
-      .toContain('split a tool call/result pair')
-    expect(validateOpManifest({ deletes: [result], rewrites: new Map(), summarizes: [] }, seqs, s))
-      .toContain('split a tool call/result pair')
-    expect(validateOpManifest({ deletes: [call, result], rewrites: new Map(), summarizes: [] }, seqs, s)).toBeNull()
+    const call = seqs[3]!
+    const result = seqs[4]!
+    const r1 = validateOpManifest({ deletes: [result], rewrites: new Map(), summarizes: [] }, seqs, s)
+    expect(r1.kind).toBe('ok')
+    if (r1.kind === 'ok') expect(new Set(r1.manifest.deletes)).toEqual(new Set([call, result]))
+    const r2 = validateOpManifest({ deletes: [call], rewrites: new Map(), summarizes: [] }, seqs, s)
+    expect(r2.kind).toBe('ok')
+    if (r2.kind === 'ok') expect(new Set(r2.manifest.deletes)).toEqual(new Set([call, result]))
   })
-  it('rejects rewriting a lone tool-call node', () => {
+  it('rewrites a tool-result node without pair-balance rejection (content-level edit)', () => {
+    // "delete a little telemetry INSIDE a tool result" must be a rewrite of
+    // that node — the node stays, so the call/result structure is intact and
+    // pair balance must NOT reject it (a partial delete must not delete the
+    // whole node, let alone its call).
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const result = seqs[4]!
+    const manifest: OpManifest = { deletes: [], rewrites: new Map([[result, 'result without telemetry']]), summarizes: [] }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.rewrites.get(result)).toBe('result without telemetry')
+  })
+  it('extends a rewrite of a tool-call node to delete its paired result', () => {
+    // Rewriting a node that carries tool calls replaces the WHOLE node (its
+    // text AND its calls); the paired results then have no matching call, so
+    // the rewrite automatically extends them into deletes — no fallback.
     const s = fixtureSession()
     const seqs = s.surface.nodes
     const call = seqs[3]!
-    const manifest: OpManifest = { deletes: [], rewrites: new Map([[call, 'x']]), summarizes: [] }
-    expect(validateOpManifest(manifest, seqs, s)).toContain('split a tool call/result pair')
+    const result = seqs[4]!
+    const manifest: OpManifest = { deletes: [], rewrites: new Map([[call, 'replaced text']]), summarizes: [] }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') {
+      expect(v.manifest.rewrites.get(call)).toBe('replaced text')
+      expect(new Set(v.manifest.deletes)).toEqual(new Set([result]))
+    }
+  })
+  it('rejects a rewrite of a tool-call node whose result is also rewritten (conflict)', () => {
+    // rewrite call + rewrite result: the call's extension wants the result
+    // deleted while the model wants it kept-and-changed — contradictory.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const call = seqs[3]!
+    const result = seqs[4]!
+    const manifest: OpManifest = {
+      deletes: [],
+      rewrites: new Map([[call, 'a'], [result, 'b']]),
+      summarizes: [],
+    }
+    expect(validateOpManifest(manifest, seqs, s))
+      .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('conflict') })
+  })
+  it('rejects a delete whose pair extension collides with a rewrite of the paired node', () => {
+    // Model: `delete: <call>` + `rewrite: <result>` (keep the result but
+    // change its content). The delete extension would pull the result into
+    // deletes, silently discarding the rewrite — this must be rejected, not
+    // silently executed.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const call = seqs[3]!
+    const result = seqs[4]!
+    const manifest: OpManifest = {
+      deletes: [call],
+      rewrites: new Map([[result, 'new result content']]),
+      summarizes: [],
+    }
+    expect(validateOpManifest(manifest, seqs, s))
+      .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('conflict') })
+  })
+  it('extends a one-sided summarize range to cover the paired node', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const call = seqs[3]!
+    const result = seqs[4]!
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(),
+      summarizes: [{ start: result, end: result, summary: 'x' }],
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') {
+      expect(v.manifest.summarizes[0]!.start).toBe(call)
+      expect(v.manifest.summarizes[0]!.end).toBe(result)
+    }
   })
   it('rejects a summarize range whose boundary seqs are missing or inverted', () => {
     const s = fixtureSession()
@@ -213,11 +300,11 @@ describe('validateOpManifest', () => {
     expect(validateOpManifest({
       deletes: [], rewrites: new Map(),
       summarizes: [{ start: seqs[1]!, end: 999_999, summary: 'x' }],
-    }, seqs, s)).toContain('not in this chunk')
+    }, seqs, s)).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('not in this chunk') })
     expect(validateOpManifest({
       deletes: [], rewrites: new Map(),
       summarizes: [{ start: seqs[3]!, end: seqs[1]!, summary: 'x' }],
-    }, seqs, s)).toContain('inverted')
+    }, seqs, s)).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('inverted') })
   })
 })
 
