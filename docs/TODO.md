@@ -230,6 +230,10 @@ Motivation (user-confirmed, deep-dived): the rewrite mode's root problem is "out
 ## Future — Deferred / optional（先不标 P，需要实施时临时升级为 P##）
 
 - [x] Trim 提速（核心）：`<<NO_CHANGE>>` 状态值已实施（PR #14）——只解决"全无可删"的边角，**不解决**"删一点点"场景（P11 承担）。剩余：真实会话验证、模型误判措辞校准。
+- [ ] **P11 时间优化（实测 556s 仍慢 + no-change，`web-20260816-153424.log`）**：9/9 片零回退 ✓，但模型**过度用 rewrite**（部分删除 = 输出整节点内容）→ 最慢片 chunk 5 = 556s（4 delete + 2 rewrite），且 checkpoint 370,769 ≥ shadowed 366,720 → **整个 trim no-change（telemetry 未删成）**。方向：
+  - **`delete-text` 操作**（根治"部分删除 → rewrite 大输出"）：模型指认 `delete-text: <seq>, "<原文片段>"` → 插件按字符串精确匹配删除该片段（零生成、零膨胀）；匹配失败回退 rewrite。对"删除散布的 telemetry 提及"是最优解（模型只需指认片段，不用重写整节点）
+  - **rewrite 膨胀诊断 + shrink 失败保守路径**：no-change 时检查哪些 rewrite 膨胀（输出 > 原文）；考虑"只执行 delete/summarize、rewrite 膨胀的节点保留原文"的保守执行，而不是整体放弃
+  - **prompt 进一步引导**：rewrite 内容必须"只含变化后的文本、未变部分保持原文"（防模型重写扩展）；节点内部分删除优先 delete-text
 - [ ] Trim latency 其余项：progress feedback（"compressing chunk N/M" / 已耗时）、cap the rendered input（先压缩再 trim）、timeout/abort affordance。README Known Limitations 已有耗时说明。
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek
