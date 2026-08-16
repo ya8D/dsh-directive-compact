@@ -918,4 +918,38 @@ describe('executeTrim', () => {
     expect(text).toContain('trimmed context') // the fallback's output
     expect(text).not.toContain('kept result content') // the conflicted manifest did not execute
   })
+
+  it('P12: executes a delete-text manifest with ONE call (fragment removal)', async () => {
+    // The P12 answer to "delete a little telemetry scattered inside a node":
+    // the model names the exact fragment, the plugin removes it verbatim —
+    // zero regeneration, no inflation, one call.
+    const s = sessionWithTurns(5)
+    const target = s.surface.nodes[0]! // '[user] first task'
+    const manifest = `delete-text: ${target}, "first"`
+    let streamCalls = 0
+    const ctx = {
+      llm: {
+        async *stream(): AsyncIterable<StreamChunk> {
+          streamCalls += 1
+          yield { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk
+          yield { type: 'text-delta', index: 0, text: manifest } as StreamChunk
+          yield { type: 'block-end', index: 0, block: { type: 'text', text: manifest } } as StreamChunk
+          yield { type: 'finish', reason: { kind: 'stop' } } as StreamChunk
+        },
+        async resolveModelInfo(): Promise<{ context: { contextWindow: number } }> {
+          return { context: { contextWindow: 1_000_000 } }
+        },
+      },
+      tokenMeter: meterWith(() => 10),
+      logger: createLoggerStub().logger,
+    } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
+    const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'remove the word first from the opening'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    expect(streamCalls).toBe(1) // executed in op mode — no fallback call
+    const text = checkpointText(s)
+    expect(text).toContain('[user]  task') // fragment removed, rest verbatim
+    expect(text).not.toContain('[user] first')
+    expect(text).toContain('[assistant] first answer') // untouched node verbatim
+  })
 })

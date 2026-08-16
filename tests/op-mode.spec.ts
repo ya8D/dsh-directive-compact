@@ -97,6 +97,7 @@ describe('buildOpModePrompt', () => {
   it('teaches the manifest grammar, the full-rewrite alternative, and embeds the directive verbatim', () => {
     const prompt = buildOpModePrompt('delete telemetry')
     expect(prompt).toContain('delete:')
+    expect(prompt).toContain('delete-text:')
     expect(prompt).toContain('rewrite:')
     expect(prompt).toContain('summarize:')
     expect(prompt).toContain('---content---')
@@ -174,6 +175,44 @@ describe('parseOpManifest', () => {
     expect(parseOpManifest('summarize: 5-3')).toMatchObject({ kind: 'invalid' })
     expect(parseOpManifest('rewrite: 1-2')).toMatchObject({ kind: 'invalid' })
   })
+  it('parses delete-text with a quoted fragment', () => {
+    const parsed = parseOpManifest('delete-text: 3, "telemetry line"')
+    expect(parsed.kind).toBe('manifest')
+    if (parsed.kind !== 'manifest') return
+    expect(parsed.manifest.deleteTexts).toEqual([{ seq: 3, fragment: 'telemetry line' }])
+  })
+  it('parses delete-text fragments containing escaped quotes and unclosed quotes', () => {
+    // Real model output (16:05 run): code fragments contain quotes, the model
+    // escapes them as \" and may leave the closing quote off.
+    const escaped = parseOpManifest('delete-text: 3, "pkg[\"session-telemetry"]')
+    expect(escaped.kind).toBe('manifest')
+    if (escaped.kind === 'manifest') {
+      expect(escaped.manifest.deleteTexts).toEqual([{ seq: 3, fragment: 'pkg["session-telemetry"]' }])
+    }
+    const unclosed = parseOpManifest('delete-text: 3, "unclosed fragment')
+    expect(unclosed.kind).toBe('manifest')
+    if (unclosed.kind === 'manifest') {
+      expect(unclosed.manifest.deleteTexts).toEqual([{ seq: 3, fragment: 'unclosed fragment' }])
+    }
+  })
+  it('parses a bare (unquoted) delete-text fragment to end of line', () => {
+    const parsed = parseOpManifest('delete-text: 3, telemetry line with spaces')
+    expect(parsed.kind).toBe('manifest')
+    if (parsed.kind !== 'manifest') return
+    expect(parsed.manifest.deleteTexts).toEqual([{ seq: 3, fragment: 'telemetry line with spaces' }])
+  })
+  it('keeps backslash sequences literal in fragments (renderings contain escaped backslashes)', () => {
+    // Tool outputs render Windows paths as literal \\ (e.g. docs\\subsystems\x).
+    // The model copies them verbatim; the parser must NOT unescape them.
+    const parsed = parseOpManifest('delete-text: 3, "docs\\\\subsystems\\\\x.md"')
+    expect(parsed.kind).toBe('manifest')
+    if (parsed.kind !== 'manifest') return
+    expect(parsed.manifest.deleteTexts).toEqual([{ seq: 3, fragment: 'docs\\\\subsystems\\\\x.md' }])
+  })
+  it('rejects malformed delete-text', () => {
+    expect(parseOpManifest('delete-text: 3')).toMatchObject({ kind: 'invalid' })
+    expect(parseOpManifest('delete-text: 3, ""')).toMatchObject({ kind: 'invalid' })
+  })
   it('treats backtick-wrapped no-change markers as no-change (matches isNoChangeMarker)', () => {
     // The model may echo the marker wrapped in backticks (the prompt quotes it);
     // this must be no-change, not an invalid prose fallback.
@@ -191,18 +230,56 @@ describe('validateOpManifest', () => {
     expect(result).toMatchObject({ kind: 'ok' })
     if (result.kind === 'ok') expect(result.manifest).toEqual(manifest)
   })
-  it('rejects seqs outside the chunk and overlaps', () => {
+  it('rejects seqs outside the chunk', () => {
     const s = fixtureSession()
     const seqs = s.surface.nodes
     expect(validateOpManifest({ deletes: [999_999], rewrites: new Map(), summarizes: [] }, seqs, s))
       .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('not in this chunk') })
+  })
+  it('dedupes repeated references to the same seq within one operation', () => {
+    // Real model output repeats an operation line (e.g. rewrite: 7369 twice);
+    // that must be idempotent, not an overlap rejection.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
     const manifest: OpManifest = {
-      deletes: [seqs[0]!],
-      rewrites: new Map([[seqs[0]!, 'x']]),
+      deletes: [seqs[0]!, seqs[0]!],
+      rewrites: new Map(),
       summarizes: [],
     }
-    expect(validateOpManifest(manifest, seqs, s))
-      .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('overlap') })
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.deletes).toEqual([seqs[0]!])
+  })
+  it('resolves cross-operation overlap conservatively (more content preserved wins)', () => {
+    // delete + rewrite on the same seq: keep the rewrite (node stays, content
+    // edited) and drop the delete. delete-text + delete: keep the precise
+    // fragment deletion, drop the whole-node delete.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const target = seqs[0]!
+    const mixed: OpManifest = {
+      deletes: [target],
+      rewrites: new Map([[target, 'edited']]),
+      summarizes: [],
+    }
+    const v1 = validateOpManifest(mixed, seqs, s)
+    expect(v1.kind).toBe('ok')
+    if (v1.kind === 'ok') {
+      expect(v1.manifest.rewrites.get(target)).toBe('edited')
+      expect(v1.manifest.deletes).toEqual([])
+    }
+    const textMixed: OpManifest = {
+      deletes: [target],
+      rewrites: new Map(),
+      summarizes: [],
+      deleteTexts: [{ seq: target, fragment: 'first' }],
+    }
+    const v2 = validateOpManifest(textMixed, seqs, s)
+    expect(v2.kind).toBe('ok')
+    if (v2.kind === 'ok') {
+      expect(v2.manifest.deleteTexts).toEqual([{ seq: target, fragment: 'first' }])
+      expect(v2.manifest.deletes).toEqual([])
+    }
   })
   it('extends a one-sided delete to the whole tool pair (no fallback)', () => {
     const s = fixtureSession()
@@ -278,6 +355,32 @@ describe('validateOpManifest', () => {
     expect(validateOpManifest(manifest, seqs, s))
       .toMatchObject({ kind: 'invalid', reason: expect.stringContaining('conflict') })
   })
+  it('drops an inflated rewrite (content > 1.1x the original) and keeps the node verbatim', () => {
+    // Real no-change run: rewrites claimed "full content minus X" but output
+    // MORE than the original, inflating the checkpoint past shrink. A rewrite
+    // larger than 1.1x its original is treated as model expansion, not
+    // deletion: the rewrite is dropped and the node stays verbatim.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const target = seqs[1]! // assistant 'first answer' (short original)
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map([[target, 'x'.repeat(1000)]]), summarizes: [],
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.rewrites.has(target)).toBe(false)
+  })
+  it('keeps a rewrite not larger than 1.1x the original', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const target = seqs[1]!
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map([[target, 'first answer']]), summarizes: [],
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.rewrites.get(target)).toBe('first answer')
+  })
   it('extends a one-sided summarize range to cover the paired node', () => {
     const s = fixtureSession()
     const seqs = s.surface.nodes
@@ -306,6 +409,71 @@ describe('validateOpManifest', () => {
       summarizes: [{ start: seqs[3]!, end: seqs[1]!, summary: 'x' }],
     }, seqs, s)).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('inverted') })
   })
+  it('accepts a delete-text whose fragment exists in the node', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: 'first' }], // 'first task'
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.deleteTexts).toEqual([{ seq: seqs[0]!, fragment: 'first' }])
+  })
+  it('accepts a fragment with leading indentation (model copies numbered-render indents)', () => {
+    // Real run (chunk 2 seq 850): the model copied "  53: | ..." with the
+    // numbered render's continuation indent; the renderSpan baseline has no
+    // indent. Leading whitespace is normalized before matching.
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: '  first' }], // indent + 'first task'
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.deleteTexts).toEqual([{ seq: seqs[0]!, fragment: '  first' }])
+  })
+  it('matches an indented backslash-literal fragment (indent + \\\\ combined, real seq-635 shape)', () => {
+    // Real run (chunk 1 seq 635): the fragment carried BOTH a leading indent
+    // (numbered-render continuation) AND literal double backslashes (tool
+    // output escapes Windows paths). The two fixes must compose.
+    const s = Session.create(SessionId('op-indent-backslash'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'docs\\\\subsystems\\\\x.md here' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: '  docs\\\\subsystems\\\\x.md' }],
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind !== 'ok') return
+    expect(v.manifest.deleteTexts).toHaveLength(1)
+    const out = executeOpManifest(v.manifest, seqs, s)
+    expect(out).toContain(' here') // fragment removed, rest verbatim
+    expect(out).not.toContain('docs\\\\subsystems\\\\x.md')
+  })
+  it('drops a delete-text whose fragment does not appear in the node (conservative)', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: 'no such text' }],
+    }
+    const v = validateOpManifest(manifest, seqs, s)
+    expect(v.kind).toBe('ok')
+    if (v.kind === 'ok') expect(v.manifest.deleteTexts ?? []).toEqual([])
+  })
+  it('rejects a delete-text seq outside the chunk', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    expect(validateOpManifest({
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: 999_999, fragment: 'x' }],
+    }, seqs, s)).toMatchObject({ kind: 'invalid', reason: expect.stringContaining('not in this chunk') })
+  })
 })
 
 describe('executeOpManifest', () => {
@@ -314,6 +482,28 @@ describe('executeOpManifest', () => {
     const out = executeOpManifest(null, s.surface.nodes, s)
     expect(out).toContain('[user] first task')
     expect(out).toContain('[user] third task')
+  })
+  it('deletes a fragment inside a node and keeps the rest verbatim', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: 'first' }], // '[user] first task'
+    }
+    const out = executeOpManifest(manifest, seqs, s)
+    expect(out).toContain('[user]  task') // fragment removed, rest verbatim
+    expect(out).not.toContain('[user] first')
+    expect(out).toContain('[user] third task')
+  })
+  it('removes EVERY occurrence of the fragment', () => {
+    const s = fixtureSession()
+    const seqs = s.surface.nodes
+    const manifest: OpManifest = {
+      deletes: [], rewrites: new Map(), summarizes: [],
+      deleteTexts: [{ seq: seqs[0]!, fragment: 't' }], // 'first task' has two 't's
+    }
+    const out = executeOpManifest(manifest, seqs, s)
+    expect(out).toContain('[user] firs ask') // both 't's gone ('first'→'firs', 'task'→'ask')
   })
   it('drops deleted nodes, replaces rewrite nodes with the role-prefixed content', () => {
     const s = fixtureSession()

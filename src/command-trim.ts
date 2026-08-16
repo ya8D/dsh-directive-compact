@@ -251,11 +251,32 @@ export async function executeTrim(
       if (parsed.kind === 'manifest') {
         const validation = validateOpManifest(parsed.manifest, chunk.seqs, session)
         if (validation.kind === 'ok') {
+          // Conservative-drop diagnostics (P12): rewrites dropped by the
+          // inflation guard and delete-text fragments that did not match are
+          // kept verbatim — surface why, so a "nothing happened" chunk is not
+          // silent.
+          for (const seq of parsed.manifest.rewrites.keys()) {
+            if (!validation.manifest.rewrites.has(seq)) {
+              logger.warn(
+                'trim-directive: chunk %d/%d rewrite seq %d dropped (inflation guard: content > 1.1x original); original kept verbatim',
+                index + 1, chunks.length, seq,
+              )
+            }
+          }
+          for (const textDelete of parsed.manifest.deleteTexts ?? []) {
+            if (!(validation.manifest.deleteTexts ?? []).some(kept => kept.seq === textDelete.seq)) {
+              logger.warn(
+                'trim-directive: chunk %d/%d delete-text seq %d fragment not found in the node; original kept verbatim | fragment: %s',
+                index + 1, chunks.length, textDelete.seq, JSON.stringify(textDelete.fragment.slice(0, 120)),
+              )
+            }
+          }
           const content = executeOpManifest(validation.manifest, chunk.seqs, session)
           logger.info(
-            'trim-directive: chunk %d/%d done in %dms (op-mode: %d delete, %d rewrite, %d summarize)',
+            'trim-directive: chunk %d/%d done in %dms (op-mode: %d delete, %d rewrite, %d summarize, %d delete-text)',
             index + 1, chunks.length, Date.now() - chunkStartedAt,
-            validation.manifest.deletes.length, validation.manifest.rewrites.size, validation.manifest.summarizes.length,
+            validation.manifest.deletes.length, validation.manifest.rewrites.size,
+            validation.manifest.summarizes.length, validation.manifest.deleteTexts?.length ?? 0,
           )
           return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
         }
