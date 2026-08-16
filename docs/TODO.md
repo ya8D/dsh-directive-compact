@@ -174,85 +174,98 @@ User hypothesis (confirmed against code): the "复杂对话 (1)" hang — `删�
 - README "When there is nothing to remove" section; CHANGELOG entry; DONE updated.
 - Typecheck + build green (72 unit + 3 e2e, real key).
 
-## P11 — Operation-mode trim（操作清单：模型决策 + 程序化执行）
+## P11 — Operation-mode trim (operation manifest: the model decides, the plugin executes)
 
 Motivation (user-confirmed, deep-dived): the rewrite mode's root problem is "output ≈ input". Real anchor "复杂对话3": 9 chunks / 362,509 ms / ~560K output tokens — every chunk that changes ANYTHING must decode ALL of its kept content (parallel, so wall time = slowest chunk ≈ 6 min), and kept content passes through the model's hands (verbatim rule protects only `[user]`; assistant/tool content can drift or lose facts). The `<<NO_CHANGE>>` status value (implemented, merged via PR #14) only covers the all-or-nothing edge — it does not speed up the "delete a little from a big surface" case. Operation mode makes the model a DECISION-MAKER instead of a content PRODUCER: it outputs a small operation manifest (delete / summarize), the plugin executes it programmatically — kept nodes are spliced verbatim (zero generation, 100% fidelity), only summary text is model-generated.
 
-### 设计（deep-dive 结论）
+### Design (deep-dive conclusion)
 
-- **输入格式（编号渲染，renderSpan 变体）**：编号 = **全局事件 seq**（复用 harness 原生 seq 体系——session 事件自带 seq、surface 节点即 seq 列表；`tool-session-query` 已用 `seq N` 让模型引用事件，用户真实指令也用过"删除 seq 1344493 那条消息"；无 surface 节点序号/编号渲染可复用，故直接复用 seq 而非自造分片内序号）。节点起始行 = `[seq <全局seq>] ` + 现有 role 前缀（`[user]` / `[assistant]` / `[tool] called tool …` / `[tool] tool result:`）；**节点内续块缩进 2 空格**（`  [role] …`）——编号行 = 节点边界，缩进 = 节点内。编号只存在于输入侧，checkpoint 拼接用无编号原文。seq 天然跨分片唯一 → **零映射**（校验即"该分片节点列表是否含此 seq"），块级编号留 Future。
-- **输出格式（严格清单模板，一行一操作 + 内容块）**：
-  - `delete: 28039, 28045`——整节点删除（逗号列表 + `28040-28045` 范围；seq 数字来自渲染 `[seq N]` 照抄，零生成）
-  - `rewrite: 28039` + `---content---` … `---end---` 内容块——**节点内部分修改**（内容 = 该节点完整替换版本，纯内容不带编号/角色前缀；插件按原节点角色拼回 `[role] ` 前缀，与无操作节点格式一致。**缺内容块或内容为空 → 校验失败回退**）
-  - `summarize: 28040-28045` + `---content---` … `---end---` 内容块（摘要纯文本，直接插入替换整个范围）
-  - 无操作：单独一行 `<<NO_CHANGE>>`（或空输出 = no-change）
-  - 规则：操作行从行首开始；内容块内任何内容原样（含空行），但不得包含 `---end---` 行
-- **节点内部分删除的分布影响（诚实修正）**：telemetry 类提及若**集中**在少数节点 → 仅那几节点 rewrite，其余节点原文拼接（接近零生成）；若**散布**在大量节点 → 逐节点 rewrite = 重写大部分节点（提速有限——散布删除语义上就需要大面积修改，无免费午餐）。提速幅度取决于提及集中度，实测锚定。
-- **解析 + 校验（正确性优先）**：格式错误/散文输出 → **回退重写式**（现有 TRIM_INSTRUCTION 路径重新调用一次，代码已存在）；编号越界 / delete 与 summarize/rewrite 重叠 / 缺内容块或为空 / 拆散 tool-call-result 对（delete 一侧必须连另一侧；rewrite tool-call 不配 result → 回退）/ 未知操作行 / `---content---`/`---end---` 不配对 → 回退；空清单 → no-change。**任何不确定都回退，绝不半执行。**
-- **执行（拼接 checkpoint）**：每片 = 无操作节点原文（renderSpan 形态，与重写式输出形态一致）拼接 + rewrite 节点替换为模型内容（插件加 role 前缀）+ summarize 范围替换为摘要 + delete 节点跳过；多片 `[part N/M]`；checkpoint = marker + guard + parts；shrink 校验、lifecycle、tool-pair 平衡照旧。
-- **禁止整片摘要化**：summarize 范围必须模型显式指出；范围外节点一律原文拼接，一个字不改（否则 trim 悄悄变成 compact）。"删 telemetry + 把登录流程压成要点"的混合指令一次表达。
-- **双模式分流（第一版简化）**：操作模式 prompt 只要求清单输出；解析失败回退重写式（一次重新调用）。模型声明模式 / 单次调用双格式分流留作增强。
-- **增强候选（Future）**：`delete-text: 28039, "精确字符串"`——模型引用原文片段，插件做字符串匹配删除（零生成、零漂移）；但模型引用可能与原文不一致 → 匹配失败回退 rewrite。第一版用 rewrite（更稳），delete-text 作增强。
+- **Input format (numbered rendering, renderSpan variant)**: numbering = **global event seq** (reuses the harness's native seq system — session events carry seq and surface nodes are a seq list; `tool-session-query` already references events as `seq N`, and a real user instruction used "delete seq 1344493 …"; no surface-node ordinal/numbered rendering exists to reuse, so seq is reused instead of inventing per-chunk ordinals). Node start line = `[seq <global seq>] ` + the existing role prefix (`[user]` / `[assistant]` / `[tool] called tool …` / `[tool] tool result:`); **in-node continuation blocks indent 2 spaces** (`  [role] …`) — a numbered line is a node boundary, an indent is inside the node. Numbering exists only on the input side; checkpoint assembly uses the unnumbered originals. seq is naturally unique across chunks → **zero mapping** (validation = "does this chunk's node list contain this seq"); block-level numbering stays Future.
+- **Output format (strict manifest template, one operation per line + content blocks)**:
+  - `delete: 28039, 28045` — whole-node deletion (comma list + `28040-28045` ranges; seq digits copied from the rendered `[seq N]`, zero generation)
+  - `rewrite: 28039` + `---content---` … `---end---` content block — **partial in-node edits** (content = the node's full replacement text, plain content without numbering/role prefix; the plugin re-adds the `[role] ` prefix from the original node, matching the untouched-node format. **Missing or empty content block → validation failure, fall back**)
+  - `summarize: 28040-28045` + `---content---` … `---end---` content block (plain summary text, inserted in place of the whole range)
+  - No operation: exactly one line `<<NO_CHANGE>>` (or empty output = no-change)
+  - Rules: operation lines start at column 0; content inside a block is verbatim (empty lines included) but must not contain a `---end---` line
+- **Distribution impact of in-node partial deletion (honest correction)**: telemetry-like mentions **concentrated** in few nodes → only those nodes rewrite, the rest splice verbatim (near-zero generation); **scattered** across many nodes → per-node rewrites = most nodes rewritten (limited speedup — a scattered deletion semantically needs wide-area edits; no free lunch). Speedup depends on mention concentration, anchored by real measurements.
+- **Parsing + validation (correctness first)**: malformed format / prose output → **fall back to rewrite mode** (the existing TRIM_INSTRUCTION path, re-called once; the code exists); out-of-range seq / delete overlapping summarize or rewrite / missing or empty content block / a split tool-call-result pair (deleting one side must include the other; rewrite tool-call without its result → fall back) / unknown operation line / unpaired `---content---`/`---end---` → fall back; empty manifest → no-change. **Any uncertainty falls back; never half-execute.**
+- **Execution (checkpoint assembly)**: per chunk = untouched-node originals (renderSpan form, matching the rewrite-mode output form) spliced + rewrite nodes replaced by model content (plugin adds the role prefix) + summarize ranges replaced by the summary + delete nodes skipped; multi-chunk `[part N/M]`; checkpoint = marker + guard + parts; shrink validation, lifecycle, and tool-pair balance unchanged.
+- **No whole-chunk summarization**: summarize ranges must be explicitly named by the model; nodes outside any range splice verbatim, not a character changed (else trim silently becomes compact). A mixed instruction like "delete telemetry + compress the login flow into bullet points" is expressed in one pass.
+- **Two-mode dispatch (v1 simplification)**: the operation-mode prompt asks for the manifest only; parse failure falls back to rewrite mode (one re-call). Model-declared mode / single-call dual-format dispatch stays an enhancement.
+- **Enhancement candidates (Future)**: `delete-text: 28039, "exact string"` — the model cites a verbatim fragment, the plugin does string-match deletion (zero generation, zero drift); a mismatched fragment falls back to rewrite. v1 uses rewrite (more robust); delete-text is the enhancement.
 
-### 预期收益（估算，待实测）
+### Expected gains (estimate, awaiting measurement)
 
-- 输出 560K → ~125K tokens（清单 + 小摘要 + 省不掉的 reasoning ~12.7K/片）→ 362s → 90-150s（3-4 倍）
-- **保真（本质改进）**：保留节点零生成 → 100% 原文，无漂移无幻觉；trim 从"模型重写"变成"模型决策 + 程序化执行"
-- 可审计：删除决策显式可见，插件可校验；模型漏删 → 保留更多 → shrink 失败 → no-change 提示（错误可见，不静默）
+- Output 560K → ~125K tokens (manifest + small summaries + unavoidable reasoning ~12.7K/chunk) → 362s → 90-150s (3-4×)
+- **Fidelity (essential improvement)**: kept nodes zero-generation → 100% original, no drift, no hallucination; trim changes from "model rewrites" to "model decides + plugin executes"
+- Auditable: deletion decisions are explicit and verifiable; the model under-deletes → keeps more → shrink fails → no-change message (visible error, not silent)
 
-### 风险与边界（诚实）
+### Risks and boundaries (honest)
 
-- 模型遵守清单格式是最大不确定性；不遵守 → 回退（正确但无提速）
-- reasoning 省不掉 → 提速有下限（"1 分钟内"做不到，除非压 thinking = 质量权衡）
-- "批量改写"类指令（50 条都改）清单会膨胀 → 边界退化；此时模型输出全文走重写路径
-- 保真第一版用渲染文本；原始 ContentBlock 拷贝（tool-result 结构）需验证 user-message 的配对约束 → Future 增强
-- 编号指认准确性（模型指错编号）→ 越界校验回退；指认漏删 → shrink 兜底
+- Model adherence to the manifest format is the biggest uncertainty; non-adherence → fall back (correct but no speedup)
+- Reasoning cannot be removed → the speedup has a floor ("within 1 minute" is unattainable without cutting thinking = quality trade)
+- "Batch rewrite"-style requirements (all 50 changed) bloat the manifest → boundary degradation; the model then outputs full text on the rewrite path
+- v1 fidelity uses rendered text; raw ContentBlock copies (tool-result structure) need user-message pairing validation → Future enhancement
+- Numbered-reference accuracy (model cites a wrong seq) → out-of-range validation falls back; under-deletion → shrink backstop
 
-### 工作项
+### Work items
 
-- [x] 编号渲染（renderSpan 变体 `renderSpanNumbered`，`[seq N]` 全局 seq 复用）+ 操作模式 prompt（`buildOpModePrompt`，delete/rewrite/summarize 三类 + `---content---`/`---end---` 块 + `<<NO_CHANGE>>`）
-- [x] 清单解析器（`parseOpManifest`：delete 列表/范围、rewrite/summarize 内容块、no-change、散文/未知行/缩进行/缺块/未配对分隔符/marker 混用全部 reject）
-- [x] 校验器（`validateOpManifest`：越界/重叠/summarize 边界缺失或反转/操作区间 tool-pair 边界平衡——工具对要么整体在操作区间内要么整体在外）→ 回退重写式
-- [x] 执行器（`executeOpManifest`：无操作节点原文拼接 + rewrite 替换（插件加 role 前缀）+ summarize 摘要替换 + delete 跳过）
-- [x] 集成：`summarizeChunkWithRetry` 增 promptBuilder/markerBuilder/renderer 参数；每片操作模式优先，解析/校验失败回退重写式（合并两次调用的 usage）；`summarizeWithDirective` 增 renderer 参数
-- [x] 单元测试（op-mode.spec.ts 22 个：渲染/prompt/解析/校验/执行；trim.spec.ts +2 命令级 delete/rewrite 端到端 + 既有断言适配双调用）
-- [x] **真实会话验证（"复杂对话4" `session-ebd5011a`，失败暴露）**：199 节点 / 366,720 tokens / 9 片，`删除telemetry相关的内容` → **830,451 ms（13.8 分钟）**，比重写式基线（362s）慢 2.3 倍。rawOutput blocks = 18 = **9 片 × 2 次调用/片**：模型 **9/9 片全部输出散文**（未遵守清单），每片 op 散文重写 + fallback 重写式二次调用 → 双倍成本。telemetry 127→0 ✓、lifecycle 完整 ✓（功能正确，性能不可接受）
-- [x] **修复（方案 B，实测驱动）**：`buildOpModePrompt` 改**双格式**（FORM 1 清单优先 / FORM 2 全文合法化——模型散文从此是合法选择，质量与重写式相当）；`command-trim.ts` 分流：**散文（parse invalid）→ 直接复用 op 输出当重写结果（1 次调用，warn 日志）**；**清单 parse 成功但 validate 失败（seq 越界等，罕见）→ 才二次调用重写式**（此时 op 输出是清单不可作内容）。最坏 = 重写式基线 1 次调用
-- [x] **回归测试（用户要求"为什么没测出来"）**：新增 `P11 regression: reuses prose op-mode output with ONE call per chunk`（断言 1 次调用 + 散文落地）与 `parseable but invalid manifest falls back to ONE rewrite call`（断言 2 次调用 + 回退输出）；既有散文路径断言从双调用改回单调用（3→2、10→5、9→5）；prompt 测试补 FORM 2 断言。100 单元 + 3 e2e
-- [x] **配对修复（TDD：先写测试后实现，105 全绿）**——真实日志（web-20260816-144813.log）显示 3 片因 `operations starting at seq X split a tool call/result pair` 回退（147-355s）：模型的操作区间从 result 开始而 call 留在区间外（模型不懂 tool-pair 约束）。修复分层（用户确认"90% 以上避免回退"）：
-  - **rewrite 豁免**：rewrite 是内容级修改（节点保留、结构不变）——仅拒绝 rewrite tool-call 节点（会使其 result 失配）；rewrite tool-result/文本节点直接允许。"result 里删一点点 telemetry" = rewrite 单节点，绝不整节点/连 call 删除
-  - **delete/summarize 配对扩展**：单侧引用（只 call 或只 result）→ 按 callId 自动纳入配对节点（须在本 chunk，跨 chunk 才拒绝）→ 零额外 LLM 调用。模型删 result 时插件自动连 call 删（整条工具记录）
-  - **parseOpManifest 反引号 marker**：`` `<<NO_CHANGE>>` `` 识别为 no-change（与 isNoChangeMarker 一致，修 chunk 5 误报）
-  - validateOpManifest 新签名 `{kind:'ok', manifest} | {kind:'invalid', reason}`（返回扩展后的 manifest）
-  - 新增测试：反引号 marker；rewrite result 豁免；rewrite call 拒绝；delete 单侧扩展（双向）；summarize 单侧扩展；命令级 rewrite result 1 次调用 / delete 单侧 1 次调用
-- [ ] Agent Note（`2026-08-16-operation-mode-trim.md`）补充实测与方案 B + 配对修复
+- [x] Numbered rendering (renderSpan variant `renderSpanNumbered`, `[seq N]` global-seq reuse) + operation-mode prompt (`buildOpModePrompt`, delete/rewrite/summarize + `---content---`/`---end---` blocks + `<<NO_CHANGE>>`)
+- [x] Manifest parser (`parseOpManifest`: delete lists/ranges, rewrite/summarize content blocks, no-change; prose/unknown lines/indented lines/missing blocks/unpaired delimiters/marker-mixing all rejected)
+- [x] Validator (`validateOpManifest`: out-of-range / overlap / summarize boundary missing or inverted / operation-range tool-pair boundary balance — a tool pair is either wholly inside or wholly outside every operation range) → fall back to rewrite mode
+- [x] Executor (`executeOpManifest`: untouched nodes spliced verbatim + rewrite replacement (plugin adds the role prefix) + summarize replacement + delete skip)
+- [x] Integration: `summarizeChunkWithRetry` gains promptBuilder/markerBuilder/renderer parameters; each chunk runs operation mode first, parse/validation failure falls back to rewrite mode (usage merged across both calls); `summarizeWithDirective` gains a renderer parameter
+- [x] Unit tests (op-mode.spec.ts 22: rendering/prompt/parse/validation/execution; trim.spec.ts +2 command-level delete/rewrite end-to-end + existing assertions adapted to the dual call)
+- [x] **Real-session verification ("复杂对话4" `session-ebd5011a`, failure exposed)**: 199 nodes / 366,720 tokens / 9 chunks, `删除telemetry相关的内容` → **830,451 ms (13.8 min)**, 2.3× slower than the rewrite baseline (362s). rawOutput blocks = 18 = **9 chunks × 2 calls per chunk**: the model **emitted prose on 9/9 chunks** (did not follow the manifest); each op-prose rewrite + fallback rewrite call → double cost. telemetry 127→0 ✓, lifecycle complete ✓ (functionally correct, performance unacceptable)
+- [x] **Fix (plan B, measurement-driven)**: `buildOpModePrompt` now offers **dual formats** (FORM 1 manifest, preferred; FORM 2 full rewrite legalized — model prose is now a legitimate choice, quality on par with rewrite mode); `command-trim.ts` dispatch: **prose (parse invalid) → reuse the op output directly as the rewrite result (1 call, warn log)**; **manifest parses but validation fails (out-of-range seq etc., rare) → one rewrite-mode re-call** (the op output is a manifest and unusable as content). Worst case = rewrite baseline 1 call
+- [x] **Regression tests (user asked "why was this not caught")**: added `P11 regression: reuses prose op-mode output with ONE call per chunk` (asserts 1 call + prose lands) and `parseable but invalid manifest falls back to ONE rewrite call` (asserts 2 calls + fallback output); existing prose-path assertions updated from dual to single call (3→2, 10→5, 9→5); prompt tests add FORM 2 assertions. 100 unit + 3 e2e
+- [x] **Pairing fix (TDD: tests first, 105 green)** — real log (web-20260816-144813.log) showed 3 chunks falling back (147-355s) on `operations starting at seq X split a tool call/result pair`: the model's operation ranges started at the result while the call stayed outside (the model does not know tool-pair constraints). Layered fix (user confirmed "90%+ of fallbacks avoided"):
+  - **rewrite exemption**: rewrite is a content-level edit (node kept, structure unchanged) — only rewrite of a tool-call node is rejected (its result would dangle); rewrite of a tool-result/text node is allowed directly. "Delete a bit of telemetry inside a result" = rewrite one node, never a whole-node/paired deletion
+  - **delete/summarize pairing extension**: one-sided reference (call only or result only) → the paired node is auto-included by callId (only when in the same chunk; cross-chunk rejects) → zero extra LLM calls. Deleting a result auto-deletes its call (the whole tool record)
+  - **parseOpManifest backtick marker**: `` `<<NO_CHANGE>>` `` recognized as no-change (consistent with isNoChangeMarker; fixes chunk 5 false positive)
+  - validateOpManifest new signature `{kind:'ok', manifest} | {kind:'invalid', reason}` (returns the extended manifest)
+  - New tests: backtick marker; rewrite-result exemption; rewrite-call rejection; delete one-sided extension (both directions); summarize one-sided extension; command-level rewrite-result 1 call / delete one-sided 1 call
+- [x] Agent Note (`2026-08-16-operation-mode-trim.md`): add the real-run measurement, plan B, and the pairing fix (landed in P13)
 
-## P12 — Trim 时间优化（delete-text + 膨胀防护）
+## P12 — Trim time optimization (delete-text + inflation guard)
 
-Motivation（实测 `web-20260816-153424.log` + "复杂对话8" `session-8e7a1427` 分析）：9/9 片零回退后，**模型过度用 rewrite**（部分删除 = 输出整节点内容）→ 最慢片 556s、checkpoint 膨胀 +4,049 → 整体 no-change（telemetry 未删成）。账目确认：结构开销仅 ~155 tokens（非原因）；**chunk 5 的 rewrite 净膨胀 +6,432**（模型"声称 full content minus X"却输出更多）吞掉了其他 8 片的缩小。
+Motivation (analysis of `web-20260816-153424.log` + "复杂对话8" `session-8e7a1427`): with 9/9 chunks at zero fallback, the **model over-uses rewrite** (partial deletion = outputs the whole node content) → slowest chunk 556s, checkpoint inflated +4,049 → overall no-change (telemetry not deleted). Accounting confirmed: structural overhead is only ~155 tokens (not the cause); **chunk 5's rewrite net inflation +6,432** (the model "claims full content minus X" but outputs more) ate the other 8 chunks' shrinkage.
 
-- [x] **rewrite 膨胀防护**（用户规格：输出 > 原文 × 1.1 → 保守用原文）：`REWRITE_INFLATION_RATIO = 1.1`（chars 对比，先于扩展逻辑保证 structural 配对一致）——膨胀的 rewrite 从清单移除、节点保留原文
-- [x] **`delete-text` 操作**（根治"部分删除 → rewrite 大输出"）：`delete-text: <seq>, "<精确片段>"` → 插件字符串精确删除该片段（零生成、零膨胀）；fragment 不在节点渲染中 → 保守移除该操作（节点保留原文）；seq 越界/与其他操作重叠 → reject
-- [x] **prompt 引导**：delete-text 语法说明 + "rewrite 内容必须接近原文（大于原文的 rewrite 会被丢弃）" + 既有 prefer-delete / result-节点引导
-- [x] 测试（TDD）：膨胀移除/保留、delete-text 解析（合法/畸形）、fragment 匹配/不匹配、越界/重叠、执行删除 + 命令级 1 次调用。118 单元 + 3 e2e
-- [x] **第二轮实测缺陷修复（`web-20260816-160515.log`，TDD）**：
-  - **delete-text 解析容错**：模型输出 `delete-text: 639, "pkg[\"session-telemetry`（代码片段含引号、`\"` 转义、未闭合引号）→ 旧正则失败 → 整段散文复用（14K/22K tokens）。修复：引号包裹的 fragment 剥首尾引号 + `\"`/`\\` 还原；裸 fragment（无引号）取行尾；空 fragment reject
-  - **overlap 去重 + 保守合并**：模型重复输出操作行（`rewrite: 7369` ×3）→ 旧逻辑同操作重复也 reject → 回退 406s/432s。修复：同操作内去重（幂等）；跨操作重叠按"保留更多内容者胜"合并（delete-text > rewrite > delete）；summarize 范围与单节点操作重叠仍 reject
-  - **structural 扩展与 delete 扩展互斥修复**：delete 扩展只遍历模型显式 deletes（structural 扩展加入的 result 与其 rewritten call 配对是合法组合，不重复检查）
-  - **fragment 不匹配日志**：打印 fragment 内容（前 120 字符）
-  - 测试 +4（转义/未闭合/裸 fragment 解析、同操作去重、跨操作合并）。123 单元 + 3 e2e
-- [x] **Review 确认（用户）**：删除优先级链顺序正确无悬空引用；structural 扩展的 result 被 delete-text 同时引用 → execute 时 delete 优先、delete-text 幂等忽略（模型矛盾指令，保守用结构删除，可接受）；残余风险：跨行引号 fragment → `(.*)` 单行正则 unrecognized → prose 污染（比修复前小得多，prompt"单行 fragment"缓解，非阻塞）
-- [x] **第三轮实测修复（`web-20260816-163134.log`，TDD）**：222s（556s → 3.7 分钟）✓ shrink 成功（366,793→365,779）✓ 9/9 零回退 ✓ 6 个 delete-text 执行 ✓，但 3 处 fragment 不匹配——根因（解码确认）：
-  - **双反斜杠**（chunk 1 seq 635）：工具输出把 Windows 路径渲染为字面 `\\`（`docs\\subsystems\\...`），模型照抄，但解析的 `\\`→`\` 还原破坏了匹配 → **去掉 `\\` 还原（只还原 `\"`）**
-  - **前导缩进**（chunk 2 seq 850 等）：模型从 numbered 渲染抄续行（`  53: | ...` 前导两空格），renderSpan 基准无缩进 → **fragment 匹配/删除前 `normalizeFragment` 去前导空白**
-  - 测试 +2（`\\` 字面保留、前导缩进匹配）。125 单元 + 3 e2e
-- [ ] 真实会话验证：delete-text 命中率（模型是否用新语法）+ 膨胀防护是否消除 no-change + 总耗时
+- [x] **Rewrite inflation guard** (user spec: output > original × 1.1 → keep the original conservatively): `REWRITE_INFLATION_RATIO = 1.1` (chars comparison, applied before the extension logic so structural pairing stays consistent) — inflated rewrites are dropped from the manifest, the node keeps its original text
+- [x] **`delete-text` operation** (root fix for "partial deletion → big rewrite output"): `delete-text: <seq>, "<exact fragment>"` → the plugin deletes the fragment by exact string match (zero generation, zero inflation); a fragment absent from the node's rendering → the operation is conservatively dropped (node keeps original); out-of-range seq / overlap with other operations → reject
+- [x] **Prompt guidance**: delete-text syntax + "rewrite content must stay close to the original (a rewrite larger than the original is discarded)" + the existing prefer-delete / result-node guidance
+- [x] Tests (TDD): inflation removal/retention, delete-text parsing (valid/malformed), fragment match/mismatch, out-of-range/overlap, execution deletion + command-level 1 call. 118 unit + 3 e2e
+- [x] **Round-2 real-run defect fixes (`web-20260816-160515.log`, TDD)**:
+  - **delete-text parse tolerance**: the model emitted `delete-text: 639, "pkg[\"session-telemetry` (a code fragment with quotes, `\"` escapes, unclosed quote) → the old regex failed → the whole output reused as prose (14K/22K tokens). Fix: strip surrounding quotes + restore `\"`/`\\`; a bare fragment (no quotes) takes the rest of the line; an empty fragment rejects
+  - **overlap dedup + conservative merge**: the model repeated operation lines (`rewrite: 7369` ×3) → the old logic rejected even same-operation duplicates → fallback 406s/432s. Fix: dedup within the same operation (idempotent); cross-operation overlap merges by "keep more content wins" (delete-text > rewrite > delete); a summarize range overlapping a single-node operation still rejects
+  - **structural-extension vs delete-extension mutual exclusion fix**: delete extension only walks the model's explicit deletes (a result added by structural extension paired with its rewritten call is a legal combination, not re-checked)
+  - **fragment-mismatch logging**: prints the fragment (first 120 chars)
+  - Tests +4 (escaped/unclosed/bare-fragment parsing, same-op dedup, cross-op merge). 123 unit + 3 e2e
+- [x] **Review confirmation (user)**: deletion-priority chain order correct with no dangling references; a result structurally extended and also referenced by delete-text → delete wins at execution, delete-text idempotently ignored (model-contradictory instruction; structural deletion is the conservative choice; acceptable); residual risk: a cross-line quoted fragment → `(.*)` single-line regex unrecognized → prose pollution (much smaller than before the fix; the "single-line fragment" prompt guidance mitigates; non-blocking)
+- [x] **Round-3 real-run fixes (`web-20260816-163134.log`, TDD)**: 222s (556s → 3.7 min) ✓ shrink success (366,793→365,779) ✓ 9/9 zero fallback ✓ 6 delete-text executions ✓, but 3 fragment mismatches — root causes (decode-confirmed):
+  - **double backslashes** (chunk 1 seq 635): tool output renders Windows paths as literal `\\` (`docs\\subsystems\\...`), the model copied them, but the parse restored `\\`→`\` and broke the match → **drop the `\\` restore (only `\"` is restored)**
+  - **leading indentation** (chunk 2 seq 850 etc.): the model copied continuation lines from the numbered rendering (`  53: | ...` leading two spaces), the renderSpan baseline has no indent → **`normalizeFragment` strips leading whitespace before matching/deleting**
+  - Tests +2 (`\\` literal retention, leading-indent match). 125 unit + 3 e2e
+- [ ] Real-session verification: delete-text hit rate (does the model use the new syntax) + does the inflation guard eliminate no-change + total wall time
 
-## Future — Deferred / optional（先不标 P，需要实施时临时升级为 P##）
+## Future — Deferred / optional (no P number yet; promote to P## when implemented)
 
-- [x] Trim 提速（核心）：`<<NO_CHANGE>>` 状态值已实施（PR #14）——只解决"全无可删"的边角，**不解决**"删一点点"场景（P11 承担）。剩余：真实会话验证、模型误判措辞校准。
-- [ ] **shrink 失败保守路径（P12 后续）**：no-change 时考虑"只执行 delete/summarize/delete-text、膨胀的 rewrite 节点保留原文"而非整体放弃（当前膨胀防护已单独丢弃膨胀 rewrite，但整体 shrink 失败仍 no-change）
-- [ ] Trim latency 其余项：progress feedback（"compressing chunk N/M" / 已耗时）、cap the rendered input（先压缩再 trim）、timeout/abort affordance。README Known Limitations 已有耗时说明。
+- [x] Trim speedup (core): the `<<NO_CHANGE>>` status value is implemented (PR #14) — it solves only the "nothing to remove" edge, **not** the "delete a little" case (P11 owns that). Remaining: real-session verification, model-misjudgment wording calibration.
+- [ ] **Conservative shrink-failure path (P12 follow-up)**: on no-change, consider executing only delete/summarize/delete-text with inflated rewrites kept verbatim instead of giving up wholesale (the inflation guard already drops inflated rewrites individually, but an overall shrink failure still reports no-change)
+- [ ] Trim latency remaining items: progress feedback ("compressing chunk N/M" / elapsed), cap the rendered input (compact before trim), timeout/abort affordance. README Known Limitations documents the time cost.
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek
 - [ ] BUG (user-verified, GUI): the trimmed/compacted conversation never disappears from the UI dialogue — both during "executing…" and AFTER the command completes. Root cause (source-verified): this is dsh's deliberate transcript design, NOT a plugin bug. The UI conversation flow renders only append-origin events (`surfaceOp === 'append'`; `isAppendSurfaceEvent`), while a trim/compaction lands a `surfaceOp: { op: 'replace' }` checkpoint — "replacement copies stay model-only" (dsh `surface.ts`). So the model sees the checkpoint but the user keeps seeing the original dialogue; upstream `/compact` behaves identically (it shows a `manual-compaction` card only for the exact command name `compact`, which our commands do not match). The data layer is correct (checkpoint lands on the surface; verified on real sessions). Fixing the UI requires an upstream `ui-conversation` change to render a replacement/compaction card for non-`compact` command names — outside this plugin; the plugin-side fallback is documentation. Options: (a) upstream UI change (high effort, harness PR + Agent Note); (b) document that the original dialogue stays visible by design and the effect is visible in the session trace (current recommendation); (c) have the plugin name its command to trigger the existing `manual-compaction` card (pollutes upstream semantics, violates pure-increment).
+
+## P13 — Standardization (harness conventions, release readiness)
+
+Align the package with DeepSeek Harness's package conventions ([adding-a-package.md](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cookbook/adding-a-package.md)) and ship the first release candidate since rc.0.
+
+- [x] README: `## Model Experience` section in the harness canonical format (one H3 per model-context entry; ordered H4 fields `What the model sees` / `Token effect` / `KV Cache effect`) covering the `/compact-directive` summarization call, the `/trim-directive` operation-mode chunk calls, and the landed checkpoint; `## Known Limitations` renamed to `## Known Limitations and Deferred Work` with the Future items folded in; new `## Configuration` table (keepHeadUsers / keepTailUsers / summarizationProvider / summarizationModel / maxTokens); extension-points subsection (injected services, owned events, untouched upstream); usage examples in English (requirements accept any natural language)
+- [x] docs/TODO.md: translate P10.2+ Chinese narration to English (real session names and verbatim user directives stay as quoted evidence); add this P13 section
+- [x] docs/DONE.md: add the P12 entry (missing) and this P13 entry
+- [x] CHANGELOG.md: add the P12 entry (delete-text / inflation guard / three real-run fix rounds); move Unreleased → `[0.1.0-rc.1]` with a date
+- [x] package.json: version `0.1.0-rc.0` → `0.1.0-rc.1`
+- [x] Agent Note `2026-08-16-operation-mode-trim.md`: add the real-run measurement (复杂对话4), plan B (prose reuse), and the pairing fix (closes the P11 open item)
+- [ ] Release verification: `npm test` + `npm run build` green; `npm pack --dry-run` lists exactly the `files` whitelist
+- [ ] Publish: `npm publish --tag rc` (maintainer); verify `dsh plugin --profile <name> add @ya8d/dsh-directive-compact@rc` resolves rc.1
