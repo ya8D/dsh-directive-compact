@@ -37,6 +37,14 @@ export interface OpSummarize {
   readonly summary: string
 }
 
+/** One fragment deletion inside a single node (P12): the exact text removed. */
+export interface OpDeleteText {
+  /** Seq of the node whose rendered text loses the fragment. */
+  readonly seq: number
+  /** Exact substring of the node's rendering to delete (verbatim match). */
+  readonly fragment: string
+}
+
 /** Parsed operation manifest: every referenced seq is a surface node seq. */
 export interface OpManifest {
   /** Whole nodes to drop (verbatim content does not enter the checkpoint). */
@@ -45,6 +53,8 @@ export interface OpManifest {
   readonly rewrites: ReadonlyMap<number, string>
   /** Node ranges replaced by one summary each. */
   readonly summarizes: readonly OpSummarize[]
+  /** Fragment deletions inside single nodes; optional for backward compat. */
+  readonly deleteTexts?: readonly OpDeleteText[]
 }
 
 /** Parse outcome: a valid manifest, a no-change, or a reject reason. */
@@ -55,6 +65,10 @@ export type OpParse =
 
 /** Content-block delimiter lines framing rewrite/summarize text. */
 const CONTENT_OPEN = '---content---'
+
+/** Max rewrite-content length relative to its original node (chars); a rewrite
+ * larger than this is model expansion and is dropped conservatively (P12). */
+const REWRITE_INFLATION_RATIO = 1.1
 const CONTENT_CLOSE = '---end---'
 
 /**
@@ -97,7 +111,8 @@ export function buildOpModePrompt(directive: string | undefined): string {
     + 'Apply the user\'s trim requirement. Reply with EXACTLY ONE of these two forms:\n'
     + 'FORM 1 — an OPERATION MANIFEST (preferred; the plugin executes it programmatically and kept nodes stay verbatim), one operation per line from the first column:\n'
     + '- `delete: <seq list>` — remove whole nodes (comma-separated seqs; ranges like 28040-28045 allowed). Prefer delete over rewrite when a WHOLE node must go — delete costs nothing, rewrite regenerates the content.\n'
-    + '- `rewrite: <seq>` — replace ONE node\'s content with your own text. Target the node that actually holds the content you want to change: to edit a tool RESULT\'s content, rewrite the result node — NEVER a tool-call node (rewriting a call replaces the call AND deletes its result).\n'
+    + '- `delete-text: <seq>, "<exact fragment>"` — delete a fragment INSIDE one node. Use it ONLY for precise in-node removal; whole nodes are `delete`, content edits are `rewrite`. The fragment MUST be a SINGLE-LINE exact substring of that node\'s text — copy it verbatim: no line numbers, no leading indentation, no truncation. Every occurrence is removed; a fragment that does not appear verbatim is ignored and the node is kept.\n'
+    + '- `rewrite: <seq>` — replace ONE node\'s content with your own text. Target the node that actually holds the content you want to change: to edit a tool RESULT\'s content, rewrite the result node — NEVER a tool-call node (rewriting a call replaces the call AND deletes its result). Keep rewritten content as close to the original as possible — a rewrite larger than the original is discarded and the original is kept.\n'
     + '- `summarize: <seq range>` — replace a range of nodes with a short summary\n'
     + 'For rewrite and summarize, put the replacement text between `---content---` and `---end---` lines directly after the operation line.\n'
     + 'FORM 2 — the trimmed context in full, rewritten by you (only when the requirement rewrites too much of the chunk for a manifest to express).\n'
@@ -132,6 +147,7 @@ export function parseOpManifest(text: string): OpParse {
   const deletes: number[] = []
   const rewrites = new Map<number, string>()
   const summarizes: OpSummarize[] = []
+  const deleteTexts: OpDeleteText[] = []
   let pending: { op: 'rewrite' | 'summarize'; start: number; end: number } | null = null
   let content: string[] | null = null
 
@@ -175,6 +191,24 @@ export function parseOpManifest(text: string): OpParse {
       deletes.push(...seqs)
       continue
     }
+    const deleteTextMatch = /^delete-text:\s*(\d+),(.*)$/.exec(line)
+    if (deleteTextMatch !== null) {
+      const seq = Number(deleteTextMatch[1]!)
+      let fragment = deleteTextMatch[2]!.trim()
+      if (fragment.startsWith('"')) {
+        // Quoted fragment: strip the wrapping quotes and restore escapes.
+        // Real model output escapes quotes inside code fragments (\" ) and
+        // may leave the closing quote off — both must parse. Backslash
+        // sequences stay LITERAL: tool outputs render Windows paths as \\ and
+        // the model copies them verbatim (unescaping would break the match).
+        fragment = fragment.slice(1)
+        if (fragment.endsWith('"')) fragment = fragment.slice(0, -1)
+        fragment = fragment.replace(/\\"/g, '"')
+      }
+      if (fragment.length === 0) return { kind: 'invalid', reason: 'empty delete-text fragment' }
+      deleteTexts.push({ seq, fragment })
+      continue
+    }
     const rewriteMatch = /^rewrite:\s*(\d+)$/.exec(line)
     if (rewriteMatch !== null) {
       if (pending !== null) return { kind: 'invalid', reason: 'rewrite/summarize without its content block' }
@@ -196,8 +230,13 @@ export function parseOpManifest(text: string): OpParse {
   }
   if (content !== null) return { kind: 'invalid', reason: 'unterminated content block' }
   if (pending !== null) return { kind: 'invalid', reason: 'rewrite/summarize without its content block' }
-  if (deletes.length === 0 && rewrites.size === 0 && summarizes.length === 0) return { kind: 'no-change' }
-  return { kind: 'manifest', manifest: { deletes, rewrites, summarizes } }
+  if (deletes.length === 0 && rewrites.size === 0 && summarizes.length === 0 && deleteTexts.length === 0) {
+    return { kind: 'no-change' }
+  }
+  const manifest: OpManifest = deleteTexts.length > 0
+    ? { deletes, rewrites, summarizes, deleteTexts }
+    : { deletes, rewrites, summarizes }
+  return { kind: 'manifest', manifest }
 }
 
 /** Validation outcome: an executable (possibly pair-extended) manifest, or a reject reason. */
@@ -240,17 +279,17 @@ export function validateOpManifest(
   const members = new Set(chunkSeqs)
   const reject = (reason: string): OpValidation => ({ kind: 'invalid', reason })
 
-  // Membership and overlap on the ORIGINAL references.
-  const referenced = new Set<number>()
+  // Membership on the ORIGINAL references (duplicates within one operation
+  // and cross-operation overlaps are resolved below, not rejected — real model
+  // output repeats operation lines and mixes delete/rewrite on one seq).
   for (const seq of manifest.deletes) {
     if (!members.has(seq)) return reject(`seq ${seq} is not in this chunk`)
-    if (referenced.has(seq)) return reject(`operation overlap on seq ${seq}`)
-    referenced.add(seq)
   }
   for (const seq of manifest.rewrites.keys()) {
     if (!members.has(seq)) return reject(`seq ${seq} is not in this chunk`)
-    if (referenced.has(seq)) return reject(`operation overlap on seq ${seq}`)
-    referenced.add(seq)
+  }
+  for (const textDelete of manifest.deleteTexts ?? []) {
+    if (!members.has(textDelete.seq)) return reject(`seq ${textDelete.seq} is not in this chunk`)
   }
   for (const range of manifest.summarizes) {
     const startIdx = chunkSeqs.indexOf(range.start)
@@ -258,9 +297,62 @@ export function validateOpManifest(
     if (startIdx === -1) return reject(`seq ${range.start} is not in this chunk`)
     if (endIdx === -1) return reject(`seq ${range.end} is not in this chunk`)
     if (startIdx > endIdx) return reject(`summarize range inverted: ${range.start}-${range.end}`)
+  }
+
+  // Dedupe within each operation, then resolve cross-operation overlap
+  // conservatively — the operation that preserves MORE content wins:
+  // delete-text (fragment only) > rewrite (node kept, content edited) >
+  // delete (whole node gone).
+  const deleteTexts: OpDeleteText[] = []
+  const textDeleteSeqs = new Set<number>()
+  for (const textDelete of manifest.deleteTexts ?? []) {
+    if (!textDeleteSeqs.has(textDelete.seq)) {
+      textDeleteSeqs.add(textDelete.seq)
+      deleteTexts.push(textDelete)
+    }
+  }
+  const deletes = new Set<number>()
+  for (const seq of new Set(manifest.deletes)) {
+    if (!textDeleteSeqs.has(seq) && !manifest.rewrites.has(seq)) deletes.add(seq)
+  }
+  const rewrites = new Map([...manifest.rewrites].filter(([seq]) => !textDeleteSeqs.has(seq)))
+
+  // A summarize range overlapping any single-node operation stays a hard
+  // reject (rare; the range cannot be meaningfully trimmed around it).
+  const singleNodeOps = new Set<number>([...deletes, ...rewrites.keys(), ...textDeleteSeqs])
+  for (const range of manifest.summarizes) {
+    const startIdx = chunkSeqs.indexOf(range.start)
+    const endIdx = chunkSeqs.indexOf(range.end)
     for (const seq of chunkSeqs.slice(startIdx, endIdx + 1)) {
-      if (referenced.has(seq)) return reject(`operation overlap on seq ${seq}`)
-      referenced.add(seq)
+      if (singleNodeOps.has(seq)) return reject(`operation overlap on seq ${seq}`)
+    }
+  }
+
+  // Inflation guard (P12): a rewrite larger than 1.1x its original is model
+  // EXPANSION, not deletion — a real run ended NO-CHANGE because rewrites
+  // claiming "full content minus X" output more than the original. Such
+  // rewrites are dropped and the node stays verbatim (conservative execute).
+  // Done BEFORE extension so structural-rewrite pairing stays consistent.
+  for (const [seq, content] of rewrites) {
+    const event = session.events[seq]
+    const message = event === undefined ? null : session.deriveEventMessage(event)
+    if (message === null) continue
+    const originalLength = renderSpan([message]).length
+    if (originalLength > 0 && content.length > originalLength * REWRITE_INFLATION_RATIO) {
+      rewrites.delete(seq)
+    }
+  }
+
+  // Fragment-match guard (P12): a delete-text whose fragment does not appear
+  // verbatim in the node's rendering cannot execute — it is dropped
+  // conservatively (the node stays untouched) rather than rejecting the whole
+  // manifest, matching the inflation guard's conservative style.
+  for (let index = deleteTexts.length - 1; index >= 0; index -= 1) {
+    const textDelete = deleteTexts[index]!
+    const event = session.events[textDelete.seq]
+    const message = event === undefined ? null : session.deriveEventMessage(event)
+    if (message === null || !renderSpan([message]).includes(normalizeFragment(textDelete.fragment))) {
+      deleteTexts.splice(index, 1)
     }
   }
 
@@ -270,9 +362,9 @@ export function validateOpManifest(
   // AND its calls); the paired results then have no matching call, so they are
   // auto-extended into deletes — the calls and their results vanish with the
   // node. A result the model also rewrites is a conflict.
-  const deletes = new Set(manifest.deletes)
+  const modelDeletes = new Set(deletes) // snapshot BEFORE structural extension
   const structuralRewrites = new Set<number>()
-  for (const seq of manifest.rewrites.keys()) {
+  for (const seq of rewrites.keys()) {
     const participant = pairParticipant(session, seq)
     if (participant?.kind !== 'call') continue
     // This rewrite replaces a node that carries tool calls: structural (the
@@ -280,7 +372,7 @@ export function validateOpManifest(
     // deleted with it.
     structuralRewrites.add(seq)
     for (const paired of pairedSeqs(session, seq)) {
-      if (manifest.rewrites.has(paired)) {
+      if (rewrites.has(paired)) {
         return reject(`rewrite seq ${seq} conflicts with the rewrite of its paired result seq ${paired}`)
       }
       if (!members.has(paired)) return reject(`paired result seq ${paired} is outside this chunk`)
@@ -289,13 +381,15 @@ export function validateOpManifest(
   }
 
   // Extend one-sided deletes to the paired node (callId-matched), in-chunk
-  // only. A pair member already claimed by rewrite or summarize is a CONFLICT:
-  // the model wants that node kept-and-changed while the delete would remove
-  // it — executing would silently discard the rewrite, so reject instead.
-  for (const seq of manifest.deletes) {
+  // only, over the MODEL's explicit deletes (not the structural-extension
+  // results — those pair with their rewritten call by design). A pair member
+  // already claimed by rewrite or summarize is a CONFLICT: the model wants
+  // that node kept-and-changed while the delete would remove it — executing
+  // would silently discard the rewrite, so reject instead.
+  for (const seq of modelDeletes) {
     const paired = pairedSeq(session, seq)
     if (paired !== null && !deletes.has(paired)) {
-      if (manifest.rewrites.has(paired)) {
+      if (rewrites.has(paired)) {
         return reject(`delete seq ${seq} conflicts with the rewrite of its paired node seq ${paired}`)
       }
       if (!members.has(paired)) return reject(`paired node seq ${paired} is outside this chunk`)
@@ -318,7 +412,7 @@ export function validateOpManifest(
         if (participant === undefined) {
           return reject(`operations starting at seq ${start} split a tool call/result pair (no crossing participant found)`)
         }
-        if (manifest.rewrites.has(participant.seq)) {
+        if (rewrites.has(participant.seq)) {
           return reject(`summarize range at seq ${start} conflicts with the rewrite of paired node seq ${participant.seq}`)
         }
         if (!members.has(participant.seq)) return reject(`paired node seq ${participant.seq} is outside this chunk`)
@@ -329,7 +423,7 @@ export function validateOpManifest(
         if (participant === null) {
           return reject(`operations ending at seq ${end} split a tool call/result pair (no crossing participant found)`)
         }
-        if (manifest.rewrites.has(participant.seq)) {
+        if (rewrites.has(participant.seq)) {
           return reject(`summarize range at seq ${end} conflicts with the rewrite of paired node seq ${participant.seq}`)
         }
         if (!members.has(participant.seq)) return reject(`paired node seq ${participant.seq} is outside this chunk`)
@@ -357,7 +451,7 @@ export function validateOpManifest(
     const conflict = claim(seq, 'delete')
     if (conflict !== null) return reject(conflict)
   }
-  for (const seq of manifest.rewrites.keys()) {
+  for (const seq of rewrites.keys()) {
     const conflict = claim(seq, 'rewrite')
     if (conflict !== null) return reject(conflict)
   }
@@ -368,6 +462,10 @@ export function validateOpManifest(
       const conflict = claim(seq, 'summarize')
       if (conflict !== null) return reject(conflict)
     }
+  }
+  for (const textDelete of deleteTexts) {
+    const conflict = claim(textDelete.seq, 'delete-text')
+    if (conflict !== null) return reject(conflict)
   }
 
   // Every handled run (deletes + structural rewrites + extended summarizes)
@@ -406,7 +504,10 @@ export function validateOpManifest(
     index = endIndex + 1
   }
 
-  return { kind: 'ok', manifest: { deletes: [...deletes], rewrites: manifest.rewrites, summarizes } }
+  const okManifest: OpManifest = deleteTexts.length > 0
+    ? { deletes: [...deletes], rewrites, summarizes, deleteTexts }
+    : { deletes: [...deletes], rewrites, summarizes }
+  return { kind: 'ok', manifest: okManifest }
 }
 
 /**
@@ -471,9 +572,27 @@ export function executeOpManifest(
       continue
     }
     const message = messagesBySeq.get(seq)
-    if (message !== undefined) parts.push(renderSpan([message]))
+    if (message !== undefined) {
+      const textDelete = (manifest?.deleteTexts ?? []).find(candidate => candidate.seq === seq)
+      if (textDelete !== undefined) {
+        // Fragment deletion inside the node (P12): remove every verbatim
+        // occurrence from the node's rendering; keep the rest untouched.
+        parts.push(renderSpan([message]).split(normalizeFragment(textDelete.fragment)).join(''))
+      } else {
+        parts.push(renderSpan([message]))
+      }
+    }
   }
   return parts.join('\n')
+}
+
+/**
+ * Normalize a delete-text fragment for matching: leading whitespace is the
+ * numbered render's continuation indent (the model copies it from the input
+ * rendering), which does not exist in the renderSpan baseline.
+ */
+function normalizeFragment(fragment: string): string {
+  return fragment.replace(/^\s+/, '')
 }
 
 /** Parse a comma-separated seq list with `A-B` ranges into flat seq numbers. */

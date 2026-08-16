@@ -227,13 +227,31 @@ Motivation (user-confirmed, deep-dived): the rewrite mode's root problem is "out
   - 新增测试：反引号 marker；rewrite result 豁免；rewrite call 拒绝；delete 单侧扩展（双向）；summarize 单侧扩展；命令级 rewrite result 1 次调用 / delete 单侧 1 次调用
 - [ ] Agent Note（`2026-08-16-operation-mode-trim.md`）补充实测与方案 B + 配对修复
 
+## P12 — Trim 时间优化（delete-text + 膨胀防护）
+
+Motivation（实测 `web-20260816-153424.log` + "复杂对话8" `session-8e7a1427` 分析）：9/9 片零回退后，**模型过度用 rewrite**（部分删除 = 输出整节点内容）→ 最慢片 556s、checkpoint 膨胀 +4,049 → 整体 no-change（telemetry 未删成）。账目确认：结构开销仅 ~155 tokens（非原因）；**chunk 5 的 rewrite 净膨胀 +6,432**（模型"声称 full content minus X"却输出更多）吞掉了其他 8 片的缩小。
+
+- [x] **rewrite 膨胀防护**（用户规格：输出 > 原文 × 1.1 → 保守用原文）：`REWRITE_INFLATION_RATIO = 1.1`（chars 对比，先于扩展逻辑保证 structural 配对一致）——膨胀的 rewrite 从清单移除、节点保留原文
+- [x] **`delete-text` 操作**（根治"部分删除 → rewrite 大输出"）：`delete-text: <seq>, "<精确片段>"` → 插件字符串精确删除该片段（零生成、零膨胀）；fragment 不在节点渲染中 → 保守移除该操作（节点保留原文）；seq 越界/与其他操作重叠 → reject
+- [x] **prompt 引导**：delete-text 语法说明 + "rewrite 内容必须接近原文（大于原文的 rewrite 会被丢弃）" + 既有 prefer-delete / result-节点引导
+- [x] 测试（TDD）：膨胀移除/保留、delete-text 解析（合法/畸形）、fragment 匹配/不匹配、越界/重叠、执行删除 + 命令级 1 次调用。118 单元 + 3 e2e
+- [x] **第二轮实测缺陷修复（`web-20260816-160515.log`，TDD）**：
+  - **delete-text 解析容错**：模型输出 `delete-text: 639, "pkg[\"session-telemetry`（代码片段含引号、`\"` 转义、未闭合引号）→ 旧正则失败 → 整段散文复用（14K/22K tokens）。修复：引号包裹的 fragment 剥首尾引号 + `\"`/`\\` 还原；裸 fragment（无引号）取行尾；空 fragment reject
+  - **overlap 去重 + 保守合并**：模型重复输出操作行（`rewrite: 7369` ×3）→ 旧逻辑同操作重复也 reject → 回退 406s/432s。修复：同操作内去重（幂等）；跨操作重叠按"保留更多内容者胜"合并（delete-text > rewrite > delete）；summarize 范围与单节点操作重叠仍 reject
+  - **structural 扩展与 delete 扩展互斥修复**：delete 扩展只遍历模型显式 deletes（structural 扩展加入的 result 与其 rewritten call 配对是合法组合，不重复检查）
+  - **fragment 不匹配日志**：打印 fragment 内容（前 120 字符）
+  - 测试 +4（转义/未闭合/裸 fragment 解析、同操作去重、跨操作合并）。123 单元 + 3 e2e
+- [x] **Review 确认（用户）**：删除优先级链顺序正确无悬空引用；structural 扩展的 result 被 delete-text 同时引用 → execute 时 delete 优先、delete-text 幂等忽略（模型矛盾指令，保守用结构删除，可接受）；残余风险：跨行引号 fragment → `(.*)` 单行正则 unrecognized → prose 污染（比修复前小得多，prompt"单行 fragment"缓解，非阻塞）
+- [x] **第三轮实测修复（`web-20260816-163134.log`，TDD）**：222s（556s → 3.7 分钟）✓ shrink 成功（366,793→365,779）✓ 9/9 零回退 ✓ 6 个 delete-text 执行 ✓，但 3 处 fragment 不匹配——根因（解码确认）：
+  - **双反斜杠**（chunk 1 seq 635）：工具输出把 Windows 路径渲染为字面 `\\`（`docs\\subsystems\\...`），模型照抄，但解析的 `\\`→`\` 还原破坏了匹配 → **去掉 `\\` 还原（只还原 `\"`）**
+  - **前导缩进**（chunk 2 seq 850 等）：模型从 numbered 渲染抄续行（`  53: | ...` 前导两空格），renderSpan 基准无缩进 → **fragment 匹配/删除前 `normalizeFragment` 去前导空白**
+  - 测试 +2（`\\` 字面保留、前导缩进匹配）。125 单元 + 3 e2e
+- [ ] 真实会话验证：delete-text 命中率（模型是否用新语法）+ 膨胀防护是否消除 no-change + 总耗时
+
 ## Future — Deferred / optional（先不标 P，需要实施时临时升级为 P##）
 
 - [x] Trim 提速（核心）：`<<NO_CHANGE>>` 状态值已实施（PR #14）——只解决"全无可删"的边角，**不解决**"删一点点"场景（P11 承担）。剩余：真实会话验证、模型误判措辞校准。
-- [ ] **P11 时间优化（实测 556s 仍慢 + no-change，`web-20260816-153424.log`）**：9/9 片零回退 ✓，但模型**过度用 rewrite**（部分删除 = 输出整节点内容）→ 最慢片 chunk 5 = 556s（4 delete + 2 rewrite），且 checkpoint 370,769 ≥ shadowed 366,720 → **整个 trim no-change（telemetry 未删成）**。方向：
-  - **`delete-text` 操作**（根治"部分删除 → rewrite 大输出"）：模型指认 `delete-text: <seq>, "<原文片段>"` → 插件按字符串精确匹配删除该片段（零生成、零膨胀）；匹配失败回退 rewrite。对"删除散布的 telemetry 提及"是最优解（模型只需指认片段，不用重写整节点）
-  - **rewrite 膨胀诊断 + shrink 失败保守路径**：no-change 时检查哪些 rewrite 膨胀（输出 > 原文）；考虑"只执行 delete/summarize、rewrite 膨胀的节点保留原文"的保守执行，而不是整体放弃
-  - **prompt 进一步引导**：rewrite 内容必须"只含变化后的文本、未变部分保持原文"（防模型重写扩展）；节点内部分删除优先 delete-text
+- [ ] **shrink 失败保守路径（P12 后续）**：no-change 时考虑"只执行 delete/summarize/delete-text、膨胀的 rewrite 节点保留原文"而非整体放弃（当前膨胀防护已单独丢弃膨胀 rewrite，但整体 shrink 失败仍 no-change）
 - [ ] Trim latency 其余项：progress feedback（"compressing chunk N/M" / 已耗时）、cap the rendered input（先压缩再 trim）、timeout/abort affordance。README Known Limitations 已有耗时说明。
 - [ ] UI rendering of the `compaction/directive-before-after` comparison (upstream conversation UI change; requires a harness PR with its own Agent Note)
 - [ ] With-key e2e: safety-refusal probe for aggressively negative directives on DeepSeek
