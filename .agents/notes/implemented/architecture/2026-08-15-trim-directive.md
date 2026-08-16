@@ -23,15 +23,15 @@ An earlier design protected the skeleton (render + range exclusion after the las
 
 ### Directive-only prompt
 
-The prompt is `TRIM_INSTRUCTION` + the requirement verbatim + the rendered surface. There is no four-point baseline: unlike `/compact-directive`, the trim imposes no "keep task goal / findings / next step" floor — the user's requirement is the sole instruction (the ContextForge `compact_by_directive` shape). The requirement passes through unmodified; the model decides what survives.
+Each chunk call runs the operation-mode prompt first (`buildOpModePrompt` + numbered rendering, P11): the model replies with an operation manifest (FORM 1) or the chunk rewritten in full (FORM 2). A manifest that parses and validates executes programmatically; prose output is reused directly as that chunk's rewrite; only a parseable-but-invalid manifest falls back to the rewrite prompt (`TRIM_INSTRUCTION` + unnumbered rendering). There is no four-point baseline: unlike `/compact-directive`, the trim imposes no "keep task goal / findings / next step" floor — the user's requirement is the sole instruction (the ContextForge `compact_by_directive` shape). The requirement passes through unmodified; the model decides what survives.
 
 ### Summarizing lifecycle, not the model-free prune
 
-A trim is a summarization transaction (one LLM call), so it uses the full lifecycle: `compaction/start` (standalone, `turn: null`) → `compaction/summary` → `user/message` replace (checkpoint source via `compactCheckpointSource`, `sourceEventSeqs` covering every shadowed node plus the start/summary seqs) → `compaction/end`. Failure closes the lifecycle with the error, mirroring `/compact-directive`. The earlier keyword design's `compaction/prune` shadow-price protocol is gone with it.
+A trim is a summarization transaction (per-chunk summarization calls, parallel since P8, each chunk op-mode-first since P11), so it uses the full lifecycle: `compaction/start` (standalone, `turn: null`) → `compaction/summary` → `user/message` replace (checkpoint source via `compactCheckpointSource`, `sourceEventSeqs` covering every shadowed node plus the start/summary seqs) → `compaction/end`. Failure closes the lifecycle with the error, mirroring `/compact-directive`. The earlier keyword design's `compaction/prune` shadow-price protocol is gone with it.
 
 ### Shrink validation
 
-The framed checkpoint must be smaller than the shadowed span (mirror of the upstream convergence check); a larger or equal checkpoint fails with a `summary`-class error rather than landing a trim that grew the context.
+The framed checkpoint must be smaller than the shadowed span (mirror of the upstream convergence check). Since P10.3 an unshrunk checkpoint is a no-change SUCCESS, not a failure: the lifecycle closes cleanly (`start → summary → end`, no replace) and the command reports `Nothing to trim: …` — never a retry loop or a spurious error.
 
 ### Balanced cuts
 

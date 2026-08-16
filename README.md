@@ -66,13 +66,14 @@ Both requirements are plain free text **in any natural language**. Examples:
 
 ```
 delete: 28039, 28045          remove whole nodes
+delete-text: 28039, "..."     delete an exact fragment inside one node (zero generation)
 rewrite: 28039                replace one node (partial edits) → its full new text
 summarize: 28040-28045        replace a range with a short summary
 ---content--- … ---end---     (the replacement text for rewrite/summarize)
 <<NO_CHANGE>>                 nothing to change in this chunk
 ```
 
-The plugin then **executes the manifest programmatically**: untouched nodes splice into the checkpoint **verbatim** (zero generation — 100% fidelity, no drift, no hallucination), deleted nodes drop, rewritten nodes take the model's content, summarized ranges take the summary. Only the changed nodes spend time in the model — a trim that touches a few nodes of a large session no longer pays for regenerating the ~350K tokens that stay the same. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) **falls back to the rewrite mode** below — the plugin never half-executes.
+The plugin then **executes the manifest programmatically**: untouched nodes splice into the checkpoint **verbatim** (zero generation — 100% fidelity, no drift, no hallucination), deleted nodes drop, `delete-text` fragments are removed by exact string match (also zero generation), rewritten nodes take the model's content, summarized ranges take the summary. Only the changed nodes spend time in the model — a trim that touches a few nodes of a large session no longer pays for regenerating the ~350K tokens that stay the same. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) **falls back to the rewrite mode** below — the plugin never half-executes.
 
 ### When there is nothing to remove
 

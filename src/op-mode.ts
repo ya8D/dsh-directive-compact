@@ -95,8 +95,12 @@ export function renderSpanNumbered(
 }
 
 /**
- * Build the operation-mode prompt: the directive is the sole instruction, the
- * model replies ONLY with an operation manifest over the numbered nodes.
+ * Build the operation-mode prompt: the directive is the sole instruction, and
+ * the model replies with exactly one of two forms — FORM 1, an operation
+ * manifest over the numbered nodes (preferred; the plugin executes it
+ * programmatically), or FORM 2, the chunk rewritten in full (legalized by the
+ * P11 prose-reuse fix: prose output is used directly as the chunk's rewrite,
+ * never re-called).
  * @param directive - the user's trim requirement; the command layer rejects an
  *   empty input before this is called, so `undefined` here is unreachable and
  *   fails loud rather than trimming without an instruction.

@@ -96,10 +96,11 @@ export interface TrimBudget {
  * Resolve the summarization budget for the trim.
  *
  * The plugin targets the 1M-window DeepSeek models (adapter per-response cap
- * 256K), so every number is fixed rather than window-derived:
- * - output cap = 256K per call — half the 1M window, equal to the adapter's
- *   hard per-response limit; reasoning tokens count toward this cap, so the
- *   model's thinking shares it with the visible output;
+ * 256K), so the chunk numbers are fixed rather than window-derived:
+ * - output cap = min(window/2, adapter max) per call — 256K on the 1M window,
+ *   equal to the adapter's hard per-response limit; reasoning tokens count
+ *   toward this cap, so the model's thinking shares it with the visible
+ *   output;
  * - per-chunk input = 50K heuristic tokens (~200K rendered chars) — small
  *   enough that one call completes quickly and is independently retriable,
  *   where a ~200K-token single call can take 10+ minutes or hang;

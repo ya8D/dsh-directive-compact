@@ -318,7 +318,6 @@ export async function executeTrim(
         return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
       }
       // Prose output: the model chose FORM 2 (or ignored the prompt). Its
-      // Prose output: the model chose FORM 2 (or ignored the prompt). Its
       // output IS its rewrite of the chunk, so reuse it directly — a second
       // rewrite call would double the wall time of the slowest chunk (measured
       // on a real run: op prose + fallback ≈ 14 min for one 45K-token chunk).
