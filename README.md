@@ -21,10 +21,12 @@ The `dsh` CLI is the entry point. How you invoke it depends on your setup:
 Install into a profile (replace `<name>` with `web`, `headless`, or your own):
 
 ```sh
-dsh plugin --profile <name> add @ya8d/dsh-directive-compact        # npm registry (latest)
-dsh plugin --profile <name> add @ya8d/dsh-directive-compact@rc     # npm registry (release candidate)
+dsh plugin --profile <name> add @ya8d/dsh-directive-compact@rc     # latest release candidate (recommended)
+dsh plugin --profile <name> add @ya8d/dsh-directive-compact        # latest stable (moves to the first stable release)
 dsh plugin --profile <name> add ./dsh-directive-compact            # local checkout
 ```
+
+During the release-candidate phase, `@rc` always resolves to the newest RC; the unqualified command resolves the `latest` tag, which stays on the newest RC until the first stable release moves it.
 
 The package declares `dsh.bundle`, so the plugin row is activated automatically and nothing from the upstream composition is disabled — the plugin is a pure increment (it never touches the upstream `ctx.compaction` slot or `/compact`). Remove with `dsh plugin --profile <name> remove @ya8d/dsh-directive-compact` (or the matching `pnpm dsh ...` / `npx dsh ...` form).
 
