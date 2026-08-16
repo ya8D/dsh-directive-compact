@@ -267,5 +267,5 @@ Align the package with DeepSeek Harness's package conventions ([adding-a-package
 - [x] CHANGELOG.md: add the P12 entry (delete-text / inflation guard / three real-run fix rounds); move Unreleased → `[0.1.0-rc.1]` with a date
 - [x] package.json: version `0.1.0-rc.0` → `0.1.0-rc.1`
 - [x] Agent Note `2026-08-16-operation-mode-trim.md`: add the real-run measurement (复杂对话4), plan B (prose reuse), and the pairing fix (closes the P11 open item)
-- [ ] Release verification: `npm test` + `npm run build` green; `npm pack --dry-run` lists exactly the `files` whitelist
+- [x] Release verification: `npm test` + `npm run build` green; `npm pack --dry-run` lists exactly the `files` whitelist
 - [ ] Publish: `npm publish --tag rc` (maintainer); verify `dsh plugin --profile <name> add @ya8d/dsh-directive-compact@rc` resolves rc.1
