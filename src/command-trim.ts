@@ -30,6 +30,7 @@ import { renderSpan, summarizeWithDirective } from './summarizer.js'
 import type { DirectiveSummaryResult, DirectiveTarget } from './summarizer.js'
 import { CHECKPOINT_GUARD } from './summarizer.js'
 import { buildTrimPrompt, chunkTrimNodes, resolveTrimBudget, trimMarker, TRIM_NO_CHANGE_MARKER, type PricedTrimNode, type TrimBudget } from './trim.js'
+import { buildOpModePrompt, executeOpManifest, parseOpManifest, renderSpanNumbered, validateOpManifest } from './op-mode.js'
 import { DirectiveCompactionError, openTurnNumber, resolveDirectiveTarget } from './command.js'
 import { shortDirective } from './log.js'
 
@@ -203,22 +204,74 @@ export async function executeTrim(
       )
     }
 
-    // Summarize every chunk in full parallel (up to 20 — no artificial
-    // concurrency cap). Each chunk is a full trim call over its own rendered
-    // span; HTTP 429 rate limits are retried by the adapter's retryPolicy and
-    // again by the per-chunk retry below. All chunks share the same directive
-    // and marker.
+    // Every chunk runs in full parallel (up to 20 — no artificial concurrency
+    // cap). Each chunk FIRST runs the operation-mode call (P11): the model
+    // outputs a delete/rewrite/summarize manifest over the numbered nodes and
+    // the plugin executes it programmatically (kept nodes splice verbatim —
+    // zero generation, 100% fidelity; only rewrite/summarize content is
+    // model-generated). A manifest that parses and validates executes; a
+    // no-change chunk keeps its original rendering; anything else (prose,
+    // malformed manifest, balance violation) falls back to the existing
+    // rewrite-mode call. HTTP 429 rate limits are retried by the adapter's
+    // retryPolicy and again by the per-chunk retry below.
     //
     // Per-chunk retry: a transient failure on ONE chunk (network hiccup,
     // proxy switch, adapter 5xx) must not sink the whole trim. Each chunk gets
     // up to 3 attempts (1 initial + 2 retries); cancellation and abort are
     // never retried.
-    const chunkResults = await Promise.all(chunks.map(async (chunk, index) => {
+    type ChunkResult =
+      | { kind: 'op'; content: string; index: number; rawOutput: ContentBlock[]; usage?: TokenUsage }
+      | { kind: 'rewrite'; result: DirectiveSummaryResult; index: number; chunkMessages: Message[]; noChange: boolean; usage?: TokenUsage }
+    const chunkResults = await Promise.all(chunks.map(async (chunk, index): Promise<ChunkResult> => {
       const chunkMessages: Message[] = chunk.seqs.flatMap((seq) => {
         const event = session.events[seq]
         return event === undefined ? [] : (session.deriveEventMessage(event) === null ? [] : [session.deriveEventMessage(event)!])
       })
+      const messagesBySeq = new Map<number, Message>()
+      for (const seq of chunk.seqs) {
+        const event = session.events[seq]
+        const message = event === undefined ? null : session.deriveEventMessage(event)
+        if (message !== null) messagesBySeq.set(seq, message)
+      }
       const chunkStartedAt = Date.now()
+      // Operation-mode call: numbered rendering + strict manifest contract.
+      const opCall = await summarizeChunkWithRetry(
+        ctx,
+        target,
+        budget,
+        chunkMessages,
+        directive,
+        session.id,
+        invocation.signal,
+        buildOpModePrompt,
+        trimMarker,
+        () => renderSpanNumbered(chunk.seqs, messagesBySeq),
+      )
+      const parsed = parseOpManifest(resultText(opCall))
+      if (parsed.kind === 'manifest') {
+        const invalid = validateOpManifest(parsed.manifest, chunk.seqs, session)
+        if (invalid === null) {
+          const content = executeOpManifest(parsed.manifest, chunk.seqs, session)
+          logger.info(
+            'trim-directive: chunk %d/%d done in %dms (op-mode: %d delete, %d rewrite, %d summarize)',
+            index + 1, chunks.length, Date.now() - chunkStartedAt,
+            parsed.manifest.deletes.length, parsed.manifest.rewrites.size, parsed.manifest.summarizes.length,
+          )
+          return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
+        }
+        logger.debug(
+          'trim-directive: chunk %d/%d op manifest rejected (%s); falling back to rewrite mode',
+          index + 1, chunks.length, invalid,
+        )
+      } else if (parsed.kind === 'no-change') {
+        const content = executeOpManifest(null, chunk.seqs, session)
+        logger.info(
+          'trim-directive: chunk %d/%d done in %dms (op-mode: no change; original kept verbatim)',
+          index + 1, chunks.length, Date.now() - chunkStartedAt,
+        )
+        return { kind: 'op', content, index, rawOutput: opCall.rawOutput ?? [], usage: opCall.usage }
+      }
+      // Fallback: the rewrite-mode call (the model's free-form trimmed output).
       const result = await summarizeChunkWithRetry(
         ctx,
         target,
@@ -230,11 +283,11 @@ export async function executeTrim(
       )
       const noChange = isNoChangeMarker(result)
       logger.info(
-        'trim-directive: chunk %d/%d done in %dms (%d output tokens)%s',
+        'trim-directive: chunk %d/%d done in %dms (rewrite mode, %d output tokens)%s',
         index + 1, chunks.length, Date.now() - chunkStartedAt, result.usage?.outputTokens ?? 0,
         noChange ? ' — model declared no change; original content kept verbatim' : '',
       )
-      return { result, index, chunkMessages, noChange }
+      return { kind: 'rewrite', result, index, chunkMessages, noChange, usage: mergeUsage(opCall.usage, result.usage) }
     }))
     if (invocation.signal.aborted) {
       throw new DirectiveCompactionError('cancelled', 'directive trim was cancelled')
@@ -242,11 +295,12 @@ export async function executeTrim(
     logger.info('trim-directive: all %d chunks done in %dms', chunks.length, Date.now() - startedAt)
 
     // Assemble one checkpoint: marker + guard once, then each chunk's content
-    // under a [part N/M] divider. A chunk whose model call returned the
-    // no-change marker keeps its ORIGINAL rendering verbatim (the content must
-    // survive in the checkpoint anyway, and paying the model to regenerate it
-    // is the entire wall-time cost); a changed chunk contributes the model's
-    // trimmed output.
+    // under a [part N/M] divider. An op-mode chunk contributes its executed
+    // manifest output (kept nodes spliced verbatim, rewrite/summarize replaced,
+    // deletes dropped); a rewrite-mode chunk contributes the model's trimmed
+    // output, or its ORIGINAL rendering verbatim when the model declared no
+    // change (the content must survive in the checkpoint anyway, and paying
+    // the model to regenerate it is the entire wall-time cost).
     const partCount = chunkResults.length
     const assembled: ContentBlock[] = [
       { type: 'text', text: trimMarker(directive) },
@@ -254,22 +308,28 @@ export async function executeTrim(
     ]
     const rawOutput: ContentBlock[] = []
     let usage: TokenUsage | undefined
-    for (const { result, index, chunkMessages, noChange } of chunkResults) {
+    for (const chunkResult of chunkResults) {
       if (partCount > 1) {
-        assembled.push({ type: 'text', text: `[part ${index + 1}/${partCount}]` })
+        assembled.push({ type: 'text', text: `[part ${chunkResult.index + 1}/${partCount}]` })
       }
-      if (noChange) {
-        assembled.push({ type: 'text', text: renderSpan(chunkMessages) })
+      if (chunkResult.kind === 'op') {
+        assembled.push({ type: 'text', text: chunkResult.content })
+        rawOutput.push(...chunkResult.rawOutput)
+        usage = mergeUsage(usage, chunkResult.usage)
+      } else if (chunkResult.noChange) {
+        assembled.push({ type: 'text', text: renderSpan(chunkResult.chunkMessages) })
+        rawOutput.push(...chunkResult.result.rawOutput ?? [])
+        usage = mergeUsage(usage, chunkResult.usage)
       } else {
-        for (const block of result.summary) {
+        for (const block of chunkResult.result.summary) {
           // Skip the per-chunk marker/guard repeats; the single head covers them.
           if (block.type === 'text'
             && (block.text === trimMarker(directive) || block.text === CHECKPOINT_GUARD)) continue
           assembled.push(block)
         }
+        rawOutput.push(...chunkResult.result.rawOutput ?? [])
+        usage = mergeUsage(usage, chunkResult.usage)
       }
-      rawOutput.push(...result.rawOutput ?? [])
-      usage = mergeUsage(usage, result.usage)
     }
 
     const shadowedTokenCount = priced.reduce((total, node) => total + node.tokens, 0)
@@ -362,6 +422,11 @@ export async function executeTrim(
  * @param directive - the user's trim requirement.
  * @param sessionId - owning session id for request routing.
  * @param signal - cancellation signal; retries stop when it aborts.
+ * @param promptBuilder - prompt prefix for this call; the operation-mode path
+ *   passes `buildOpModePrompt`, the rewrite path the default `buildTrimPrompt`.
+ * @param markerBuilder - checkpoint marker builder; both paths pass `trimMarker`.
+ * @param renderer - span renderer; the operation-mode path passes the numbered
+ *   renderer so the model can reference nodes by seq.
  * @returns the summarization result from the first successful attempt.
  */
 async function summarizeChunkWithRetry(
@@ -372,6 +437,9 @@ async function summarizeChunkWithRetry(
   directive: string,
   sessionId: SessionId,
   signal: AbortSignal,
+  promptBuilder: (directive: string | undefined) => string = buildTrimPrompt,
+  markerBuilder: (directive: string) => string = trimMarker,
+  renderer?: (messages: readonly Message[]) => string,
 ): Promise<DirectiveSummaryResult> {
   const logger = ctx.logger('dsh-directive-compact')
   const attempts = 3 // 1 initial + 2 retries
@@ -386,8 +454,9 @@ async function summarizeChunkWithRetry(
         directive,
         sessionId,
         signal,
-        buildTrimPrompt,
-        trimMarker,
+        promptBuilder,
+        markerBuilder,
+        renderer,
       )
     } catch (error: unknown) {
       lastError = error
@@ -405,6 +474,14 @@ async function summarizeChunkWithRetry(
     }
   }
   throw lastError
+}
+
+/** The chunk call's full text output, newline-joined (for manifest parsing). */
+function resultText(result: DirectiveSummaryResult): string {
+  return (result.rawOutput ?? [])
+    .filter((block): block is TextBlock => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
 }
 
 /** Sum disjoint provider usage buckets across chunk calls. */

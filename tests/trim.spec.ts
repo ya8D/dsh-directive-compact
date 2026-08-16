@@ -379,7 +379,9 @@ describe('executeTrim', () => {
     } as unknown as Pick<Context, 'llm' | 'tokenMeter' | 'logger'>
     const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
-    expect(streamCalls).toBe(2) // 1 initial + 1 retry
+    // The first stream call (op-mode) fails transiently and its retry succeeds;
+    // the prose output then falls back to a rewrite-mode call.
+    expect(streamCalls).toBe(3) // op-mode: 1 initial + 1 retry; rewrite fallback: 1
     const types = s.events.slice(before).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
   })
@@ -466,8 +468,10 @@ describe('executeTrim', () => {
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
     // 13 nodes × 15K = 195K > 50K chunk budget → chunks of 3 nodes (45K):
-    // 13 nodes = 4 full chunks + 1 remainder chunk = 5 parallel stream calls.
-    expect(streamCalls).toBe(5)
+    // 13 nodes = 4 full chunks + 1 remainder chunk = 5 chunks. Each chunk
+    // runs an op-mode call whose prose output falls back to a rewrite-mode
+    // call → 5 × 2 = 10 stream calls.
+    expect(streamCalls).toBe(10)
     // Lifecycle still start → summary → replace → end.
     const types = s.events.slice(before).map(e => e.type)
     expect(types).toEqual(['compaction/start', 'compaction/summary', 'user/message', 'compaction/end'])
@@ -479,9 +483,9 @@ describe('executeTrim', () => {
     expect(text).toContain('[part 5/5]')
     // The single head marker appears once; part bodies are appended.
     expect(text.split('[Directive trim, per requirement: drop all]').length - 1).toBe(1)
-    // Usage is merged across chunks.
+    // Usage is merged across all 10 calls.
     const usage = (summaryEvent.data as { usage?: { inputTokens: number } }).usage
-    expect(usage?.inputTokens).toBe(5)
+    expect(usage?.inputTokens).toBe(10)
   })
 
   it('logs phase milestones with timings for a multi-chunk trim', async () => {
@@ -605,8 +609,10 @@ describe('executeTrim', () => {
     const result = await executeTrim(ctx as never, invocationFor(agentFor(s), 'drop all'))
     expect(result.kind).toBe('success')
     if (result.kind !== 'success') return
-    // 13 nodes × 15K = 195K > 50K → 5 chunks; chunk 1 declares no change.
-    expect(streamCalls).toBe(5)
+    // 13 nodes × 15K = 195K > 50K → 5 chunks. Chunk 1 declares no change in
+    // its op-mode call (1 stream call, no fallback); chunks 2-5 output prose,
+    // so each falls back to a rewrite-mode call (2 stream calls each) → 9.
+    expect(streamCalls).toBe(9)
     const text = checkpointText(s)
     // Chunk 1's original rendering survives verbatim (the role-prefixed span).
     expect(text).toContain('[part 1/5]')
@@ -633,5 +639,45 @@ describe('executeTrim', () => {
     if (result.kind !== 'success') return
     // Not a pure marker reply → assembled as normal content.
     expect(checkpointText(s)).toContain(`keep this ${TRIM_NO_CHANGE_MARKER} inline`)
+  })
+
+  it('P11: executes an op-mode delete manifest into the checkpoint', async () => {
+    const s = sessionWithTurns(5)
+    const target = s.surface.nodes[0]! // the 'first task' user node
+    const manifestChunks = [
+      { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk,
+      { type: 'text-delta', index: 0, text: `delete: ${target}` } as StreamChunk,
+      { type: 'block-end', index: 0, block: { type: 'text', text: `delete: ${target}` } } as StreamChunk,
+      { type: 'finish', reason: { kind: 'stop' } } as StreamChunk,
+    ]
+    const result = await executeTrim(fakeCtx(manifestChunks) as never, invocationFor(agentFor(s), 'drop the first task'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    const text = checkpointText(s)
+    // The deleted node is gone; the rest of the chunk splices verbatim.
+    expect(text).not.toContain('[user] first task')
+    expect(text).toContain('[assistant] first answer')
+    expect(text).toContain('[user] rules')
+    // No marker/fallback artifacts: the checkpoint is the executed manifest.
+    expect(text).not.toContain('delete:')
+  })
+
+  it('P11: executes an op-mode rewrite manifest with the model content', async () => {
+    const s = sessionWithTurns(5)
+    const target = s.surface.nodes[0]!
+    const rewrite = `rewrite: ${target}\n---content---\nrewritten task\n---end---`
+    const manifestChunks = [
+      { type: 'block-start', index: 0, blockType: 'text' } as StreamChunk,
+      { type: 'text-delta', index: 0, text: rewrite } as StreamChunk,
+      { type: 'block-end', index: 0, block: { type: 'text', text: rewrite } } as StreamChunk,
+      { type: 'finish', reason: { kind: 'stop' } } as StreamChunk,
+    ]
+    const result = await executeTrim(fakeCtx(manifestChunks) as never, invocationFor(agentFor(s), 'rework the first task'))
+    expect(result.kind).toBe('success')
+    if (result.kind !== 'success') return
+    const text = checkpointText(s)
+    // The node's role prefix is re-added; the model content replaces the node.
+    expect(text).toContain('[user] rewritten task')
+    expect(text).not.toContain('[user] first task')
   })
 })
