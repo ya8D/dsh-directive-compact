@@ -52,8 +52,10 @@ export interface PlanConfig {
 }
 
 /**
- * Default head/tail budgets. The single source the command layer (P3) and
- * tests both use, so production defaults cannot drift from test expectations.
+ * Default head/tail budgets used by the tests. The shipped defaults live in
+ * the `Config` schema (`src/index.ts`, both default 3); this constant pins the
+ * same numbers for test expectations, so a schema change cannot silently drift
+ * the tests.
  */
 export const DEFAULT_PLAN_CONFIG: PlanConfig = {
   keepHeadUsers: 3,

@@ -1,14 +1,12 @@
 # @ya8d/dsh-directive-compact
 
-A natural-language compaction plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It lets you tell the agent — in plain language — what to keep, what to drop, and how to compress an existing conversation.
-
-Designed for large-context models (1M-token window, e.g. `deepseek-v4-flash`).
+A natural-language compaction plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness): tell the agent — in plain language — what to keep, what to drop, and how to compress an existing conversation. Designed for large-context models (1M-token window, e.g. `deepseek-v4-flash`).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/compact-directive <requirement>` | Compresses the **middle** of the conversation. Keeps the session's fixed head (first user message + injected `agent-instructions` / `system-prompt` / `skill-catalog`) and the recent turns verbatim; summarizes everything between them per your requirement. |
+| `/compact-directive <requirement>` | Compresses the **middle** of the conversation. Keeps the session's fixed head (first user message + injected `agent-instructions` / `system-prompt` / `skill-catalog`) and the recent turns verbatim; summarizes everything between them per your requirement. The requirement is mandatory — an empty one returns a usage error. |
 | `/trim-directive <requirement>` | Trims the **whole conversation** per your requirement, with **no region protection and no system-node protection** — any content can be deleted by natural-language instruction, including the head, the injected skeleton, and anything `/compact-directive` cannot reach. |
 
 > **⚠️ Destructive — fork first.** A trim/compaction permanently removes content from the model-visible conversation. There is no undo and no minimum retention. The original text is *not* lost (the session log is append-only and records every removed node), but restoring it needs tooling. **Fork the session before destructive experiments.**
@@ -28,24 +26,15 @@ dsh plugin --profile <name> add @ya8d/dsh-directive-compact@rc     # npm registr
 dsh plugin --profile <name> add ./dsh-directive-compact            # local checkout
 ```
 
-The package declares `dsh.bundle`, so the plugin row is activated automatically and nothing from the upstream composition is disabled. Remove with `dsh plugin --profile <name> remove @ya8d/dsh-directive-compact` (or the matching `pnpm dsh ...` / `npx dsh ...` form).
-
-This plugin is a **pure increment**: it never touches the upstream `ctx.compaction` slot, never registers automatic-compaction listeners, and leaves `/compact` exactly as it is.
+The package declares `dsh.bundle`, so the plugin row is activated automatically and nothing from the upstream composition is disabled — the plugin is a pure increment (it never touches the upstream `ctx.compaction` slot or `/compact`). Remove with `dsh plugin --profile <name> remove @ya8d/dsh-directive-compact` (or the matching `pnpm dsh ...` / `npx dsh ...` form).
 
 ## Usage
 
-Both requirements are plain free text.
-
-**`/compact-directive`** — the requirement is mandatory (an empty one returns a usage error). Example:
+Both requirements are plain free text **in any natural language**. Examples:
 
 ```
-/compact-directive 保留登录相关的报错，压缩其余中间过程
-```
-
-**`/trim-directive`** — the requirement decides everything that survives. Example:
-
-```
-/trim-directive 删除所有关于 git 操作的记录，保留用户原始指令和插件开发目标
+/compact-directive keep the login-related errors, compress the rest of the middle process
+/trim-directive delete all git-operation records, keep the user's original instructions and the plugin-development goal
 ```
 
 ### How the two differ
@@ -59,62 +48,55 @@ Both requirements are plain free text.
 
 ### Operation mode (how a trim actually cuts)
 
-`/trim-directive` first runs every chunk in **operation mode**: the model sees the chunk as numbered nodes (`[seq 28039] [user] …`, reusing the harness's global event seq — the same numbering `session-query` uses) and replies with a small **operation manifest** instead of regenerating the whole context:
+`/trim-directive` runs every chunk in **operation mode**: the model sees each node numbered with its global event seq (`[seq 28039] [user] …`) and replies with a small **operation manifest**:
 
 ```
 delete: 28039, 28045          remove whole nodes
+delete-text: 28039, "..."     delete an exact fragment inside one node
 rewrite: 28039                replace one node (partial edits) → its full new text
 summarize: 28040-28045        replace a range with a short summary
 ---content--- … ---end---     (the replacement text for rewrite/summarize)
 <<NO_CHANGE>>                 nothing to change in this chunk
 ```
 
-The plugin then **executes the manifest programmatically**: untouched nodes splice into the checkpoint **verbatim** (zero generation — 100% fidelity, no drift, no hallucination), deleted nodes drop, rewritten nodes take the model's content, summarized ranges take the summary. Only the changed nodes spend time in the model — a trim that touches a few nodes of a large session no longer pays for regenerating the ~350K tokens that stay the same. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) **falls back to the rewrite mode** below — the plugin never half-executes.
+The plugin then **executes the manifest programmatically**: untouched nodes keep their original text, deleted nodes drop, `delete-text` fragments are removed by exact string match, rewritten nodes take the model's content, summarized ranges take the summary. Any malformed or uncertain manifest (prose, unknown ops, out-of-range seqs, overlaps, a split tool call/result pair, missing content) **falls back to a plain rewrite** of the chunk — the plugin never half-executes.
 
 ### When there is nothing to remove
 
 A trim/compaction that finds nothing worth changing is a **normal outcome, not a failure**:
 
-- **Per-chunk declaration (trim).** If the requirement changes nothing in a chunk, the model replies with exactly `<<NO_CHANGE>>` (or an empty manifest); the command layer keeps that chunk's **original rendering verbatim** in the checkpoint (the content must survive anyway, and paying the model to regenerate it is the entire wall-time cost). A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.
-- **Shrink validation.** If the assembled checkpoint is still not smaller than the span it replaces (e.g. every chunk declared no change), the command reports a no-change success — `Nothing to trim: …` / `Nothing to compact: …` — records the output in the compaction lifecycle, and leaves the conversation exactly as it was. It never loops, retries, or hangs on a rewrite that cannot shrink. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns with a message instead of churning for many minutes.)
+- **Per-chunk declaration (trim).** If the requirement changes nothing in a chunk, the model replies with exactly `<<NO_CHANGE>>` (or an empty manifest); the command layer keeps that chunk's **original rendering verbatim** in the checkpoint. A marker buried in other output is treated as content, not a declaration — a model that misuses the marker can only fail to shrink, never silently drop content.
+- **Shrink validation.** If the assembled checkpoint is still not smaller than the span it replaces (e.g. every chunk declared no change), the command reports a no-change success — `Nothing to trim: …` / `Nothing to compact: …` — and leaves the conversation exactly as it was. It never loops, retries, or hangs. (This is why a directive like "delete all telemetry mentions" on a session with no telemetry returns with a message instead of churning for many minutes.)
 
 ### Where the command and its effect appear
 
 - **Commands are log-only, not dialogue.** Like every dsh slash command (including upstream `/compact`), these commands do not appear as messages in the conversation UI. The invocation, result, and compaction lifecycle are visible in the **session trace/log**.
 - **The original dialogue stays visible in the UI after a trim/compaction.** The conversation transcript never erases what you already saw (dsh's design; upstream `/compact` behaves the same). The **model** uses the checkpointed context on its next request — to verify the effect, read the session trace, not the chat transcript.
 
-### Observability (where a trim/compaction spends its time)
+## Configuration
 
-Both commands log through the Cordis logger service under the `dsh-directive-compact` scope, so the dsh console shows a colored `[I] dsh-directive-compact …` line per phase:
+All fields are validated through the Cordis `Config` schema and settable from `cordis.yml`:
 
-- **Info** (visible at the default level): `begin` (directive, surface size, budget / chunk plan), per-chunk completion with elapsed ms and output tokens, `all N chunks done in …ms`, and `committed` (nodes/tokens replaced → checkpoint tokens, total ms). A failed run logs `failed — <reason> (<ms>)` at **warn**, as do per-chunk call retries (`chunk call failed, retrying (2/3): …`).
-- **Debug** (hidden unless enabled): the summarization call's time-to-first-chunk and total stream time, and each chunk's seq range and token price. Enable with the console exporter's level for the plugin scope, e.g. in `cordis.yml`:
-
-  ```yaml
-  - id: logger-console
-    name: '@deepseek-ai/cordis-plugin-logger-console'
-    config:
-      levels:
-        dsh-directive-compact: 3   # 0 error, 1 info, 2 warn, 3 debug
-  ```
-
-  A long `first chunk in …` gap points at network/provider latency before generation; a long `chunk N/M done in …` points at the model's thinking time on that chunk; a stalled run with no `chunk … done` line after `begin` is a hung LLM call, not a plugin hang.
+| Field | Default | Meaning |
+|---|---|---|
+| `keepHeadUsers` | `3` | User turns kept verbatim at the head (after the fixed skeleton) when planning the compact middle. |
+| `keepTailUsers` | `3` | User turns kept verbatim at the tail; the last user utterance is always kept regardless. |
+| `summarizationProvider` | `''` | Provider for the summarization call; falls back to the routed provider when empty. |
+| `summarizationModel` | `''` | Model for the summarization call; falls back to the routed model when empty. |
+| `maxTokens` | `8192` | Generation cap for the `/compact-directive` summarization call. |
 
 ## Known Limitations
 
-- **Large conversations are handled automatically.** Every summarization call is bounded to the routed model's context window. On the 1M window: output capped at 256K, per-chunk input at 50K, up to 20 chunks summarized in **parallel** and assembled into one checkpoint with `[part N/M]` dividers. The 256K output cap is **per chunk with no cross-chunk aggregate cap** — the real total output is bounded by the shrink validation on the assembled checkpoint (it must be smaller than the span it replaces), so a model cannot "win" by filling every chunk. Input beyond the window fails loud. A transient failure on one chunk retries it (up to 3 attempts); cancellation is never retried.
-- **Thinking is not disabled, so a trim can take tens of seconds to minutes — more on large conversations.** The model reasons about your requirement before writing the trimmed context (deliberately — disabling reasoning would hurt the cut decisions). Cost scales with the surface: a small conversation (~10K rendered tokens) trims in minutes; a large one (~180K+ tokens, several parallel 50K chunks) can take 5–10+ minutes. There is no progress output yet (see TODO P11).
+- **A trim can take minutes.** The model reasons about your requirement before cutting (deliberately — disabling reasoning would hurt the cut decisions). A small conversation trims in about three minutes; a large one (~180K+ tokens, several parallel 50K chunks) can take 5–10+ minutes.
 - **Model judgment is the trim's engine — and its limit.** The model decides what survives from the rendered dialogue. It generally follows the requirement, but it is *not* a deterministic per-node delete: a surgical instruction ("delete exactly this one message") can be interpreted as a broader compression, and an ambiguous requirement may yield an unexpected result. Check the session trace after a trim.
 - **The injected skeleton is trim-able, and regenerates.** `/trim-directive` can remove the injected `agent-instructions` / `system-prompt` / `skill-catalog` nodes. They are re-created on the next request by the agent loop, so the model keeps its environment; nothing needs manual re-injection.
-- **No before/after rendering in the UI.** The conversation transcript never erases what you already saw (see [Where the command and its effect appear](#where-the-command-and-its-effect-appear)); to see the trim's effect, read the session trace.
+- **A trim whose total input exceeds 20 × 50K heuristic tokens fails loud** with "compact the session first" — before any model call opens. Compact the session first, then trim again.
 
-## Development
+## Further reading
 
-```sh
-npm test            # unit suite (no network/credentials)
-npm run test:e2e    # real DeepSeek calls; self-skips without a key
-npm run build       # tsc → lib/
-```
+- [docs/observability.md](docs/observability.md) — what each log line means, enabling debug output, diagnosing a slow or stalled run.
+- [docs/model-experience.md](docs/model-experience.md) — what the model sees and the token / KV-cache effects of each command.
+- [docs/testing.md](docs/testing.md) — running the test suites.
 
 ## License
 

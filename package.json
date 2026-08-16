@@ -1,7 +1,7 @@
 {
   "name": "@ya8d/dsh-directive-compact",
   "description": "Pure-incremental directive-driven compaction for DeepSeek Harness: /compact-directive <requirement> summarizes the session middle per your requirement, /trim-directive <requirement> trims the whole conversation per your requirement",
-  "version": "0.1.0-rc.0",
+  "version": "0.1.0-rc.1",
   "license": "MIT",
   "publishConfig": {
     "access": "public"
